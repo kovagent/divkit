@@ -1,0 +1,322 @@
+//! Parquet reader/writer for dividend rows.
+//!
+//! # File layout
+//!
+//! ```text
+//! dividends-{year}.parquet   (UInt32 cik, Utf8 ticker?, Date32 period_start,
+//!                              Date32 period_end, Float64 amount,
+//!                              Utf8 concept, Utf8 accn, Utf8 form?)
+//! ```
+//!
+//! Dates are stored as Arrow `Date32` (days since Unix epoch, 1970-01-01).
+//! `concept` is stored as `"Declared"` or `"CashPaid"`.
+
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+
+use arrow::array::{Array, Date32Array, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use chrono::NaiveDate;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
+
+use crate::record::Concept;
+use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// A flat row suitable for columnar parquet storage, combining CIK + ticker
+/// with the per-event fields from `DivEvent`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DivRow {
+    pub cik: u32,
+    pub ticker: Option<String>,
+    pub period_start: NaiveDate,
+    pub period_end: NaiveDate,
+    pub amount: f64,
+    pub concept: Concept,
+    pub accn: String,
+    pub form: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+
+fn dividend_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("cik", DataType::UInt32, false),
+        Field::new("ticker", DataType::Utf8, true),
+        Field::new("period_start", DataType::Date32, false),
+        Field::new("period_end", DataType::Date32, false),
+        Field::new("amount", DataType::Float64, false),
+        Field::new("concept", DataType::Utf8, false),
+        Field::new("accn", DataType::Utf8, false),
+        Field::new("form", DataType::Utf8, true),
+    ]))
+}
+
+// ---------------------------------------------------------------------------
+// Date helpers
+// ---------------------------------------------------------------------------
+
+fn to_date32(d: NaiveDate) -> i32 {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    (d - epoch).num_days() as i32
+}
+
+fn from_date32(days: i32) -> Option<NaiveDate> {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    epoch.checked_add_signed(chrono::Duration::days(days as i64))
+}
+
+// ---------------------------------------------------------------------------
+// Concept helpers
+// ---------------------------------------------------------------------------
+
+fn concept_to_str(c: Concept) -> &'static str {
+    match c {
+        Concept::Declared => "Declared",
+        Concept::CashPaid => "CashPaid",
+    }
+}
+
+fn str_to_concept(s: &str) -> Result<Concept> {
+    match s {
+        "Declared" => Ok(Concept::Declared),
+        "CashPaid" => Ok(Concept::CashPaid),
+        other => Err(Error::Parquet(format!("unknown concept value: {other:?}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer properties
+// ---------------------------------------------------------------------------
+
+fn writer_props() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(3).expect("valid zstd level"),
+        ))
+        .set_max_row_group_size(10_000)
+        .build()
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Write dividend rows to a parquet file at `path` (creates or overwrites).
+///
+/// Column order: `cik`, `ticker`, `period_start`, `period_end`, `amount`,
+/// `concept`, `accn`, `form`.
+pub fn write_dividends(path: &Path, rows: &[DivRow]) -> Result<()> {
+    let schema = dividend_schema();
+
+    let cik: UInt32Array = rows.iter().map(|r| Some(r.cik)).collect();
+    let ticker: StringArray = rows.iter().map(|r| r.ticker.as_deref()).collect();
+    let period_start: Date32Array = rows.iter().map(|r| Some(to_date32(r.period_start))).collect();
+    let period_end: Date32Array = rows.iter().map(|r| Some(to_date32(r.period_end))).collect();
+    let amount: Float64Array = rows.iter().map(|r| Some(r.amount)).collect();
+    let concept: StringArray = rows.iter().map(|r| Some(concept_to_str(r.concept))).collect();
+    let accn: StringArray = rows.iter().map(|r| Some(r.accn.as_str())).collect();
+    let form: StringArray = rows.iter().map(|r| r.form.as_deref()).collect();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(cik),
+            Arc::new(ticker),
+            Arc::new(period_start),
+            Arc::new(period_end),
+            Arc::new(amount),
+            Arc::new(concept),
+            Arc::new(accn),
+            Arc::new(form),
+        ],
+    )?;
+
+    let file = fs::File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(writer_props()))?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
+}
+
+/// Parse a parquet file (supplied as in-memory bytes) into `DivRow` records.
+pub fn read_dividends(bytes: &[u8]) -> Result<Vec<DivRow>> {
+    let owned: bytes::Bytes = bytes::Bytes::copy_from_slice(bytes);
+    let builder = ParquetRecordBatchReaderBuilder::try_new(owned)?;
+    let reader = builder.build()?;
+
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+
+        let cik_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::Parquet("cik column type mismatch".into()))?;
+        let ticker_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::Parquet("ticker column type mismatch".into()))?;
+        let period_start_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .ok_or_else(|| Error::Parquet("period_start column type mismatch".into()))?;
+        let period_end_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .ok_or_else(|| Error::Parquet("period_end column type mismatch".into()))?;
+        let amount_col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| Error::Parquet("amount column type mismatch".into()))?;
+        let concept_col = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::Parquet("concept column type mismatch".into()))?;
+        let accn_col = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::Parquet("accn column type mismatch".into()))?;
+        let form_col = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::Parquet("form column type mismatch".into()))?;
+
+        for i in 0..batch.num_rows() {
+            let period_start = from_date32(period_start_col.value(i))
+                .ok_or_else(|| Error::Parquet(format!("invalid period_start at row {i}")))?;
+            let period_end = from_date32(period_end_col.value(i))
+                .ok_or_else(|| Error::Parquet(format!("invalid period_end at row {i}")))?;
+            let concept = str_to_concept(concept_col.value(i))?;
+
+            rows.push(DivRow {
+                cik: cik_col.value(i),
+                ticker: if ticker_col.is_null(i) {
+                    None
+                } else {
+                    Some(ticker_col.value(i).to_owned())
+                },
+                period_start,
+                period_end,
+                amount: amount_col.value(i),
+                concept,
+                accn: accn_col.value(i).to_owned(),
+                form: if form_col.is_null(i) {
+                    None
+                } else {
+                    Some(form_col.value(i).to_owned())
+                },
+            });
+        }
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_dividend_rows() {
+        let dir = std::env::temp_dir().join("divkit_pq_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dividends-2024.parquet");
+        let d = chrono::NaiveDate::parse_from_str("2024-03-15", "%Y-%m-%d").unwrap();
+        let rows = vec![DivRow {
+            cik: 21344,
+            ticker: Some("KO".into()),
+            period_start: d,
+            period_end: d,
+            amount: 0.485,
+            concept: crate::Concept::Declared,
+            accn: "a".into(),
+            form: Some("10-Q".into()),
+        }];
+        write_dividends(&path, &rows).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let back = read_dividends(&bytes).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].cik, 21344);
+        assert_eq!(back[0].ticker.as_deref(), Some("KO"));
+        assert!((back[0].amount - 0.485).abs() < 1e-9);
+        assert_eq!(back[0].concept, crate::Concept::Declared);
+    }
+
+    #[test]
+    #[ignore]
+    fn make_fixture() {
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let path = fixture_dir.join("dividends-2024.parquet");
+
+        let rows = vec![
+            DivRow {
+                cik: 21344,
+                ticker: Some("KO".into()),
+                period_start: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                period_end: chrono::NaiveDate::from_ymd_opt(2024, 3, 15).unwrap(),
+                amount: 0.485,
+                concept: crate::Concept::Declared,
+                accn: "ko".into(),
+                form: Some("10-Q".into()),
+            },
+            DivRow {
+                cik: 21344,
+                ticker: Some("KO".into()),
+                period_start: chrono::NaiveDate::from_ymd_opt(2024, 4, 1).unwrap(),
+                period_end: chrono::NaiveDate::from_ymd_opt(2024, 6, 14).unwrap(),
+                amount: 0.485,
+                concept: crate::Concept::Declared,
+                accn: "ko".into(),
+                form: Some("10-Q".into()),
+            },
+            DivRow {
+                cik: 21344,
+                ticker: Some("KO".into()),
+                period_start: chrono::NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
+                period_end: chrono::NaiveDate::from_ymd_opt(2024, 9, 13).unwrap(),
+                amount: 0.485,
+                concept: crate::Concept::Declared,
+                accn: "ko".into(),
+                form: Some("10-Q".into()),
+            },
+            DivRow {
+                cik: 21344,
+                ticker: Some("KO".into()),
+                period_start: chrono::NaiveDate::from_ymd_opt(2024, 10, 1).unwrap(),
+                period_end: chrono::NaiveDate::from_ymd_opt(2024, 12, 13).unwrap(),
+                amount: 0.485,
+                concept: crate::Concept::Declared,
+                accn: "ko".into(),
+                form: Some("10-Q".into()),
+            },
+        ];
+
+        write_dividends(&path, &rows).unwrap();
+        println!("wrote fixture → {}", path.display());
+    }
+}

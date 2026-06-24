@@ -9,3 +9,6 @@ pub use record::{Concept, DivEvent, DividendSnapshot, Frequency};
 
 mod price;
 pub use price::PriceProvider;
+
+pub mod parquet_io;
+pub use parquet_io::{read_dividends, write_dividends, DivRow};
