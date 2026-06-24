@@ -1,0 +1,53 @@
+name: backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_year:
+        description: "First year to backfill (default 2009)"
+        required: false
+        default: "2009"
+      with_bulk:
+        description: "Include bulk EDGAR downloads"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install builder
+        run: pip install -e builder
+
+      - name: Backfill data
+        env:
+          DIVKIT_CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+        run: |
+          ARGS="--from-year ${{ inputs.from_year }} --out data"
+          if [ "${{ inputs.with_bulk }}" = "true" ]; then
+            ARGS="$ARGS --with-bulk"
+          fi
+          python -m divkit_builder.build backfill $ARGS
+
+      - name: Commit data
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add data/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(data): backfill from ${{ inputs.from_year }} via workflow_dispatch"
+            git push
+          else
+            echo "no changes to commit"
+          fi

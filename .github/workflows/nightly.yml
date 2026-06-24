@@ -1,0 +1,41 @@
+name: nightly
+
+on:
+  schedule:
+    # 07:00 UTC — after EDGAR's nightly XBRL refresh (~04:00–06:00 UTC).
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install builder
+        run: pip install -e builder
+
+      - name: Build nightly data
+        env:
+          DIVKIT_CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+        run: python -m divkit_builder.build nightly --out data
+
+      - name: Commit if changed
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add data/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(data): nightly $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "no changes to commit"
+          fi
