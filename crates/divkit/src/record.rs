@@ -78,17 +78,16 @@ impl DividendSnapshot {
         }
     }
 
-    /// Sum of the last K dividends (K from payment frequency: monthly=12,
-    /// quarterly=4, semi-annual=2, annual=1), anchored to the most recently
-    /// reported dividend. Returns `0.0` if the most recent dividend is older
-    /// than ~400 days (stopped payer).
+    /// Indicated Annual Dividend (IAD) as of a given date.
     ///
-    /// `as_of` is used **only** as a staleness gate: if the most recently
-    /// reported dividend is older than ~400 days relative to `as_of`, the
-    /// company is treated as having stopped paying and `0.0` is returned.
+    /// Computes the median of the last `K` regular payments × `K`, where `K`
+    /// is the payment frequency (monthly 12 / quarterly 4 / semi-annual 2 /
+    /// annual 1). Using the median rejects special dividends and XBRL
+    /// period-rollup anomalies. Returns `0.0` if the most recent dividend is
+    /// older than ~400 days (stopped payer).
     ///
-    /// For Irregular/None frequency the sum falls back to a trailing-365-day
-    /// window anchored to the most recent reported dividend.
+    /// For Irregular/None frequency the estimate falls back to a
+    /// trailing-365-day sum anchored to the most recent reported dividend.
     pub fn annual_amount_as_of(&self, as_of: NaiveDate) -> f64 {
         let ev = self.distinct();
         if ev.is_empty() {
@@ -112,9 +111,20 @@ impl DividendSnapshot {
         };
 
         if k > 0 {
-            // Sum the most-recent K distinct events by period_end.
-            // If fewer than K exist, sum all available.
-            return ev.iter().rev().take(k).map(|e| e.amount).sum();
+            // Take the most-recent min(K, len) distinct events and compute
+            // their median, then scale by K.  The median rejects one-off
+            // special dividends and XBRL rollup outliers that would otherwise
+            // inflate a simple sum.
+            let take = k.min(ev.len());
+            let mut amounts: Vec<f64> = ev.iter().rev().take(take).map(|e| e.amount).collect();
+            amounts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = if amounts.len() % 2 == 1 {
+                amounts[amounts.len() / 2]
+            } else {
+                let mid = amounts.len() / 2;
+                (amounts[mid - 1] + amounts[mid]) / 2.0
+            };
+            return median * k as f64;
         }
 
         // Irregular/None: fall back to trailing-365-day sum anchored to last.
@@ -133,10 +143,11 @@ impl DividendSnapshot {
         ev.last().unwrap().amount
     }
 
-    /// Sum of the last K dividends (K from payment frequency: monthly=12,
-    /// quarterly=4, semi-annual=2, annual=1), anchored to the most recently
-    /// reported dividend. Returns `0.0` if the most recent dividend is older
-    /// than ~400 days — a company that stopped paying decays to zero.
+    /// Indicated Annual Dividend (IAD): the median of the last K regular
+    /// payments times K, where K is the payment frequency (monthly 12 /
+    /// quarterly 4 / semi-annual 2 / annual 1). Using the median rejects
+    /// special dividends and XBRL period-rollup anomalies. Returns 0 if the
+    /// most recent dividend is older than ~400 days (stopped payer).
     ///
     /// Use [`annual_amount_as_of`](Self::annual_amount_as_of) for
     /// deterministic testing or historical back-calculations.
@@ -305,6 +316,48 @@ mod tests {
         let y = annual / 50.0;
         assert!((y - (1.94 / 50.0)).abs() < 1e-9);
         assert_eq!(snap.yield_on(0.0), 0.0);
+    }
+
+    /// Realty Income (O) regression guard: monthly payer where XBRL rollup
+    /// causes 3 of 12 events to appear inflated.  The median should track the
+    /// real per-share amount and the IAD must stay near the true annual figure,
+    /// not be inflated by the anomalies.
+    #[test]
+    fn monthly_median_rejects_xbrl_rollup_outliers() {
+        // 9 regular payments of 0.27, 3 rollup anomalies at 0.80, 1.07, 0.54.
+        // Events in ascending order with ~30-day spacing.
+        let snap = DividendSnapshot::from_events(
+            "O".into(),
+            726854,
+            vec![
+                ev("2023-01-15", 0.27),
+                ev("2023-02-15", 0.80), // rollup anomaly
+                ev("2023-03-15", 0.27),
+                ev("2023-04-15", 0.27),
+                ev("2023-05-15", 1.07), // rollup anomaly
+                ev("2023-06-15", 0.27),
+                ev("2023-07-15", 0.27),
+                ev("2023-08-15", 0.54), // rollup anomaly
+                ev("2023-09-15", 0.27),
+                ev("2023-10-15", 0.27),
+                ev("2023-11-15", 0.27),
+                ev("2023-12-15", 0.27),
+            ],
+        );
+        assert_eq!(snap.frequency(), Frequency::Monthly);
+        let as_of = NaiveDate::from_ymd_opt(2023, 12, 15).unwrap();
+        let iad = snap.annual_amount_as_of(as_of);
+        // Median of all 12 amounts (sorted):
+        // [0.27,0.27,0.27,0.27,0.27,0.27,0.27,0.27,0.27,0.54,0.80,1.07]
+        // middle two (index 5,6) = 0.27, 0.27 → median = 0.27
+        // IAD = 0.27 * 12 = 3.24
+        assert!(
+            (iad - 3.24).abs() < 0.01,
+            "IAD {iad} should be ~3.24, not inflated by rollup anomalies"
+        );
+        // Confirm it is NOT close to the simple-sum which would be inflated:
+        // simple sum = 9*0.27 + 0.80 + 1.07 + 0.54 = 2.43 + 2.41 = 4.84
+        assert!(iad < 3.5, "IAD {iad} must not be inflated by outliers");
     }
 
     #[test]
