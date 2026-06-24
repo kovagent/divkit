@@ -6,3 +6,6 @@ pub use error::{Error, Result};
 
 mod record;
 pub use record::{Concept, DivEvent, DividendSnapshot, Frequency};
+
+mod price;
+pub use price::PriceProvider;

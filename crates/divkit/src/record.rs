@@ -77,6 +77,11 @@ impl DividendSnapshot {
         if price <= 0.0 { return 0.0; }
         self.annual_amount() / price
     }
+
+    pub async fn yield_with(&self, p: &dyn crate::price::PriceProvider) -> crate::Result<f64> {
+        let price = p.spot(&self.ticker).await?;
+        Ok(self.yield_on(price))
+    }
 }
 
 #[cfg(test)]
