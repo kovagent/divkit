@@ -218,6 +218,7 @@ fn cmd_append_today() -> anyhow::Result<()> {
 
 fn freq_label(f: &Frequency) -> &'static str {
     match f {
+        Frequency::Monthly => "Monthly",
         Frequency::Quarterly => "Quarterly",
         Frequency::SemiAnnual => "SemiAnnual",
         Frequency::Annual => "Annual",

@@ -10,6 +10,7 @@ pub enum Concept {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Frequency {
+    Monthly,
     Quarterly,
     SemiAnnual,
     Annual,
@@ -69,6 +70,7 @@ impl DividendSnapshot {
         gaps.sort_unstable();
         let med = gaps[gaps.len() / 2];
         match med {
+            d if d <= 45 => Frequency::Monthly,
             d if d <= 135 => Frequency::Quarterly,
             d if d <= 225 => Frequency::SemiAnnual,
             d if d <= 450 => Frequency::Annual,
@@ -76,18 +78,17 @@ impl DividendSnapshot {
         }
     }
 
-    /// Trailing 12-month dividend sum, evaluated as of *as_of*.
+    /// Sum of the last K dividends (K from payment frequency: monthly=12,
+    /// quarterly=4, semi-annual=2, annual=1), anchored to the most recently
+    /// reported dividend. Returns `0.0` if the most recent dividend is older
+    /// than ~400 days (stopped payer).
     ///
     /// `as_of` is used **only** as a staleness gate: if the most recently
     /// reported dividend is older than ~400 days relative to `as_of`, the
     /// company is treated as having stopped paying and `0.0` is returned.
     ///
-    /// Otherwise the trailing-365-day window is anchored to the most recent
-    /// reported dividend (not to `as_of`).  EDGAR filing lag means the
-    /// current quarter is often not filed yet, so a window anchored to
-    /// today would catch only 3 of 4 quarterly payments and undercount an
-    /// active payer.  Anchoring to the last reported dividend yields the
-    /// complete annual figure.
+    /// For Irregular/None frequency the sum falls back to a trailing-365-day
+    /// window anchored to the most recent reported dividend.
     pub fn annual_amount_as_of(&self, as_of: NaiveDate) -> f64 {
         let ev = self.distinct();
         if ev.is_empty() {
@@ -101,8 +102,22 @@ impl DividendSnapshot {
             return 0.0;
         }
 
-        // Trailing-365 sum anchored to the most recent reported dividend, so
-        // filing lag on the current quarter does not undercount active payers.
+        // Determine K from payment frequency.
+        let k: usize = match self.frequency() {
+            Frequency::Monthly => 12,
+            Frequency::Quarterly => 4,
+            Frequency::SemiAnnual => 2,
+            Frequency::Annual => 1,
+            Frequency::Irregular | Frequency::None => 0,
+        };
+
+        if k > 0 {
+            // Sum the most-recent K distinct events by period_end.
+            // If fewer than K exist, sum all available.
+            return ev.iter().rev().take(k).map(|e| e.amount).sum();
+        }
+
+        // Irregular/None: fall back to trailing-365-day sum anchored to last.
         let cutoff = last - Duration::days(365);
         let trailing: f64 = ev
             .iter()
@@ -113,20 +128,14 @@ impl DividendSnapshot {
             return trailing;
         }
 
-        // Sparse history but `last` is recent (gate already passed): annualize
-        // the most-recent payment by inferred frequency.
-        let recent = ev.last().unwrap().amount;
-        match self.frequency() {
-            Frequency::Quarterly => recent * 4.0,
-            Frequency::SemiAnnual => recent * 2.0,
-            Frequency::Annual => recent,
-            _ => recent,
-        }
+        // Sparse history but `last` is recent (gate already passed): return
+        // the most-recent payment as-is (do not annualise Irregular/None).
+        ev.last().unwrap().amount
     }
 
-    /// Sum of the trailing 12 months of cash dividends ending at the most
-    /// recently reported dividend (so EDGAR filing lag does not undercount
-    /// active payers). Returns `0.0` if the most recent dividend is older
+    /// Sum of the last K dividends (K from payment frequency: monthly=12,
+    /// quarterly=4, semi-annual=2, annual=1), anchored to the most recently
+    /// reported dividend. Returns `0.0` if the most recent dividend is older
     /// than ~400 days — a company that stopped paying decays to zero.
     ///
     /// Use [`annual_amount_as_of`](Self::annual_amount_as_of) for
@@ -167,8 +176,7 @@ mod tests {
 
     #[test]
     fn annual_amount_sums_trailing_year() {
-        // 4 quarterly dividends — anchor as_of to 2024-12-13 so all 4 fall
-        // within the trailing 365-day window and the result is deterministic.
+        // 4 quarterly dividends — last-4 sum = 4 × 0.485 = 1.94.
         let snap = DividendSnapshot::from_events(
             "KO".into(),
             21344,
@@ -181,6 +189,80 @@ mod tests {
         );
         let as_of = NaiveDate::from_ymd_opt(2024, 12, 13).unwrap();
         assert!((snap.annual_amount_as_of(as_of) - 1.94).abs() < 1e-9);
+    }
+
+    /// Regression guard: 5 quarterly events spanning slightly over a year must
+    /// return the last-4 sum (5.20), not the all-5 sum (6.44).
+    #[test]
+    fn five_quarter_regression_returns_last_four() {
+        // ~91-day spacing; mimic JNJ amounts 1.24, 1.30, 1.30, 1.30, 1.30.
+        let snap = DividendSnapshot::from_events(
+            "JNJ".into(),
+            200406,
+            vec![
+                ev("2023-03-07", 1.24),
+                ev("2023-06-06", 1.30),
+                ev("2023-09-05", 1.30),
+                ev("2023-12-05", 1.30),
+                ev("2024-03-06", 1.30),
+            ],
+        );
+        let as_of = NaiveDate::from_ymd_opt(2024, 3, 6).unwrap();
+        // last-4 = 1.30 × 4 = 5.20; NOT all-5 = 6.44
+        assert!((snap.annual_amount_as_of(as_of) - 5.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn monthly_frequency_detected_and_annual_sums_last_12() {
+        // 13 monthly events ~30 days apart; last 12 each pay 0.10 → 1.20.
+        let dates = [
+            "2023-01-15",
+            "2023-02-15",
+            "2023-03-15",
+            "2023-04-15",
+            "2023-05-15",
+            "2023-06-15",
+            "2023-07-15",
+            "2023-08-15",
+            "2023-09-15",
+            "2023-10-15",
+            "2023-11-15",
+            "2023-12-15",
+            "2024-01-15",
+        ];
+        let snap = DividendSnapshot::from_events(
+            "MTHLY".into(),
+            99001,
+            dates.iter().map(|d| ev(d, 0.10)).collect(),
+        );
+        assert_eq!(snap.frequency(), Frequency::Monthly);
+        let as_of = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        // last 12 × 0.10 = 1.20
+        assert!((snap.annual_amount_as_of(as_of) - 1.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn semi_annual_sums_last_two() {
+        let snap = DividendSnapshot::from_events(
+            "SA".into(),
+            99002,
+            vec![ev("2023-06-15", 1.00), ev("2023-12-15", 1.05)],
+        );
+        assert_eq!(snap.frequency(), Frequency::SemiAnnual);
+        let as_of = NaiveDate::from_ymd_opt(2023, 12, 15).unwrap();
+        assert!((snap.annual_amount_as_of(as_of) - 2.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn annual_frequency_returns_last_one() {
+        let snap = DividendSnapshot::from_events(
+            "ANN".into(),
+            99003,
+            vec![ev("2022-12-15", 2.00), ev("2023-12-15", 2.50)],
+        );
+        assert_eq!(snap.frequency(), Frequency::Annual);
+        let as_of = NaiveDate::from_ymd_opt(2023, 12, 15).unwrap();
+        assert!((snap.annual_amount_as_of(as_of) - 2.50).abs() < 1e-9);
     }
 
     #[test]
@@ -228,8 +310,6 @@ mod tests {
     #[test]
     fn annual_amount_decays_to_zero_for_stale_payer() {
         // A company whose last dividend was ~3 years before as_of must return 0.0.
-        // The trailing-365d window is empty, and the 400-day recency gate
-        // suppresses the frequency-fallback annualisation.
         let snap = DividendSnapshot::from_events(
             "STALE".into(),
             99999,
