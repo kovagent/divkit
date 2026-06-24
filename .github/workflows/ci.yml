@@ -61,3 +61,6 @@ jobs:
 
       - name: Tests (pytest)
         run: pytest builder/tests
+
+      - name: Validate parquet shards
+        run: python -m divkit_builder.build validate --out data

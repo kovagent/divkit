@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import datetime
 import glob
+import hashlib
+import json
 import logging
 import os
+import sys
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from . import bulk, frames, schema, sec
@@ -168,6 +172,69 @@ def run_nightly(out: str) -> None:
     logger.info("nightly: wrote %d shard(s) + manifest", len(written))
 
 
+def run_validate(out: str) -> None:
+    """Validate every dividends-*.parquet in *out* against schema and manifest.
+
+    Checks:
+    (a) Each parquet file's Arrow schema matches the builder's ``_SCHEMA``
+        (column names and types).
+    (b) ``manifest.json`` exists and records the correct ``sha256:<hexdigest>``
+        for every parquet file present.
+
+    Raises :class:`SystemExit` with a non-zero code on any mismatch.
+    """
+    pattern = os.path.join(out, "dividends-*.parquet")
+    parquet_files = sorted(glob.glob(pattern))
+
+    if not parquet_files:
+        logger.warning("validate: no dividends-*.parquet files found in %s", out)
+        # Nothing to validate is considered success (e.g. empty data dir in CI).
+        return
+
+    manifest_path = os.path.join(out, "manifest.json")
+    if not os.path.exists(manifest_path):
+        print(f"validate: FAIL — manifest.json not found in {out}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(manifest_path) as fh:
+        manifest: dict[str, str] = json.load(fh)
+
+    errors: list[str] = []
+
+    for path in parquet_files:
+        filename = os.path.basename(path)
+
+        # (a) Schema check
+        file_schema: pa.Schema = pq.read_schema(path)
+        expected: pa.Schema = schema._SCHEMA
+        if file_schema != expected:
+            errors.append(
+                f"{filename}: schema mismatch\n"
+                f"  expected: {expected}\n"
+                f"  got:      {file_schema}"
+            )
+
+        # (b) Manifest digest check
+        with open(path, "rb") as fh:
+            actual_digest = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+        recorded = manifest.get(filename)
+        if recorded is None:
+            errors.append(f"{filename}: missing from manifest.json")
+        elif recorded != actual_digest:
+            errors.append(
+                f"{filename}: digest mismatch\n"
+                f"  manifest: {recorded}\n"
+                f"  actual:   {actual_digest}"
+            )
+
+    if errors:
+        for msg in errors:
+            print(f"validate: FAIL — {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"validate: OK — {len(parquet_files)} shard(s) passed schema + manifest checks")
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -232,6 +299,20 @@ def main() -> None:
         help="Output directory containing existing shards (default: data).",
     )
 
+    # ------------------------------------------------------------------
+    # validate subcommand
+    # ------------------------------------------------------------------
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="Assert parquet schema and manifest integrity for an existing data directory.",
+    )
+    validate_parser.add_argument(
+        "--out",
+        default="data",
+        metavar="DIR",
+        help="Directory containing dividends-*.parquet and manifest.json (default: data).",
+    )
+
     args = parser.parse_args()
 
     if args.command == "backfill":
@@ -243,5 +324,11 @@ def main() -> None:
         )
     elif args.command == "nightly":
         run_nightly(out=args.out)
+    elif args.command == "validate":
+        run_validate(out=args.out)
     else:
         parser.error(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
