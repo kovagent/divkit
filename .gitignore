@@ -9,3 +9,6 @@ __pycache__/
 companyfacts.zip
 data/companyfacts.zip
 *.part
+
+# multi-agent build scratch (not shipped)
+.superpowers/
