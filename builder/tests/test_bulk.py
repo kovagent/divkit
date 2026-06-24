@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from contextlib import contextmanager
 
 
 def test_iter_company_dividends_from_zip(tmp_path):
@@ -162,3 +163,84 @@ def test_iter_company_dividends_malformed_skipped(tmp_path):
     rows = list(bulk.iter_company_dividends(str(zp), from_year=2020))
     assert len(rows) == 1
     assert rows[0].cik == 11111
+
+
+class _FakeResponse:
+    """Minimal stand-in for an httpx streaming response."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def iter_bytes(self, chunk_size=None):
+        yield self._payload
+
+
+def test_download_atomic_write(tmp_path, monkeypatch):
+    """download streams to dest atomically; no .part file remains afterward."""
+    from divkit_builder import bulk
+
+    payload = b"hello-companyfacts"
+
+    @contextmanager
+    def fake_stream(method, url, **kwargs):
+        yield _FakeResponse(payload)
+
+    monkeypatch.setattr(bulk.httpx, "stream", fake_stream)
+
+    dest = tmp_path / "companyfacts.zip"
+    result = bulk.download(str(dest))
+
+    assert result == str(dest)
+    assert dest.exists()
+    assert dest.read_bytes() == payload
+    assert not (tmp_path / "companyfacts.zip.part").exists()
+
+
+def test_download_skips_when_present(tmp_path, monkeypatch):
+    """download returns early without streaming when dest already exists non-empty."""
+    from divkit_builder import bulk
+
+    def boom(*args, **kwargs):
+        raise AssertionError("httpx.stream should not be called when dest exists")
+
+    monkeypatch.setattr(bulk.httpx, "stream", boom)
+
+    dest = tmp_path / "companyfacts.zip"
+    dest.write_bytes(b"already here")
+
+    result = bulk.download(str(dest))
+    assert result == str(dest)
+    assert dest.read_bytes() == b"already here"
+
+
+def test_download_removes_partial_on_failure(tmp_path, monkeypatch):
+    """A mid-stream failure removes the .part file and leaves no dest."""
+    from divkit_builder import bulk
+
+    @contextmanager
+    def failing_stream(method, url, **kwargs):
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def iter_bytes(self, chunk_size=None):
+                yield b"partial"
+                raise RuntimeError("connection dropped")
+
+        yield _Resp()
+
+    monkeypatch.setattr(bulk.httpx, "stream", failing_stream)
+
+    dest = tmp_path / "companyfacts.zip"
+    try:
+        bulk.download(str(dest))
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - the stream is expected to raise
+        raise AssertionError("expected RuntimeError to propagate")
+
+    assert not dest.exists()
+    assert not (tmp_path / "companyfacts.zip.part").exists()

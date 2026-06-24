@@ -106,11 +106,24 @@ def download(dest: str) -> str:
     # Large file — allow up to 30 minutes for the download.
     timeout = httpx.Timeout(connect=30.0, read=1800.0, write=None, pool=30.0)
 
-    with httpx.stream("GET", _COMPANYFACTS_URL, headers=headers, timeout=timeout, follow_redirects=True) as resp:
-        resp.raise_for_status()
-        with open(dest, "wb") as fh:
-            for chunk in resp.iter_bytes(chunk_size=1 << 20):  # 1 MiB chunks
-                fh.write(chunk)
+    # Stream into a sibling temp file and atomically rename only on success, so
+    # a download killed mid-stream never leaves a truncated *dest* that a later
+    # run would reuse as if complete.
+    tmp = dest + ".part"
+    try:
+        with httpx.stream("GET", _COMPANYFACTS_URL, headers=headers, timeout=timeout, follow_redirects=True) as resp:
+            resp.raise_for_status()
+            with open(tmp, "wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1 << 20):  # 1 MiB chunks
+                    fh.write(chunk)
+        os.replace(tmp, dest)
+    except BaseException:
+        # Remove the partial file so the next run starts clean.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
     logger.info("bulk.download: wrote %d bytes to %s", os.path.getsize(dest), dest)
     return dest
