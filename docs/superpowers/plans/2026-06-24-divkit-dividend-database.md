@@ -14,7 +14,7 @@
 - Mirror curvekit conventions exactly: flat client methods, infallible `Divkit::new()`, blocking wrappers, env overrides `DIVKIT_BASE_URL` / `DIVKIT_CACHE_DIR`, XDG cache dir default `~/.cache/divkit/`.
 - SEC `User-Agent` MUST be the bare form `divkit <contact-email>` — no parenthetical, no URL (SEC WAF returns 403 otherwise). The email is read from env `DIVKIT_CONTACT_EMAIL`, default generic placeholder `divkit-builder@example.com` (SEC accepts generic UAs — returns 200). NEVER hardcode a personal email in source committed to the public repo. CI injects the real address from GitHub secret `CONTACT_EMAIL`. Rate limit ≤ 10 req/s to `data.sec.gov` / `www.sec.gov`.
 - XBRL concepts: `CommonStockDividendsPerShareDeclared` (primary), `CommonStockDividendsPerShareCashPaid` (fallback). Unit `USD-per-shares`. Duration frame keys `CY{YYYY}Q{n}` (NOT the `I` instant suffix).
-- Parquet schema (one row per dividend observation): `cik:u32, ticker:string?, period_start:date32, period_end:date32, amount:f64, concept:string, accn:string, form:string?`. Files named `data/dividends-YYYY.parquet` sharded by `period_end` year. `manifest.json` holds SHA-256 per file.
+- Parquet schema (one row per dividend observation): `cik:u32, ticker:string?, period_start:date32, period_end:date32, amount:f64, concept:string, accn:string, form:string?`. Files named `data/dividends-YYYY.parquet` sharded by `period_end` year. `manifest.json` is a FLAT object mapping filename → `"sha256:<hexdigest>"` (e.g. `{"dividends-2024.parquet": "sha256:abc..."}`) — the format the Rust fetcher deserializes as `HashMap<String,String>`; a nested form silently disables verification.
 - Backfill default depth = earliest available XBRL (~2009) → present; `--from-year` overrides.
 - No ex-date / pay-date fields (EDGAR doesn't provide them) — out of scope by design.
 - Naming: no `Manager`/`Helper`/`Util`; use `Snapshot`/`Event`/`Provider`/`Client` idiom.
@@ -885,7 +885,7 @@ git commit -m "feat(builder): companyfacts.zip completeness pass"
 **Interfaces:**
 - Produces:
   - `schema.write_year_shards(rows: Iterable[Row], cik_ticker: dict[int,str], out_dir: str) -> list[str]` — join ticker by CIK, group by `period_end` year, write `dividends-YYYY.parquet` with the exact column order/types from Global Constraints (polars or pyarrow). Returns written paths.
-  - `schema.write_manifest(out_dir: str) -> None` — SHA-256 each `dividends-*.parquet`, write `manifest.json` `{ "dividends-2024.parquet": {"sha256": "..."} , ...}`. Format MUST match what the Rust fetcher's manifest verification expects (confirm against curvekit's manifest reader).
+  - `schema.write_manifest(out_dir: str) -> None` — SHA-256 each `dividends-*.parquet`, write `manifest.json` in the EXACT FLAT format the Rust fetcher reads: a flat object mapping filename → `"sha256:<hexdigest>"` string, e.g. `{ "dividends-2024.parquet": "sha256:abcd...", "dividends-2025.parquet": "sha256:ef01..." }`. NOT a nested `{"sha256": "..."}` object — the fetcher deserializes the manifest as `HashMap<String,String>` and strips the `sha256:` prefix (`crates/divkit/src/fetcher.rs::manifest_digest_for`). A nested form fails to parse and silently disables verification. The hex digest is lowercase SHA-256 of the parquet file bytes.
 
 - [ ] **Step 1: Write the failing test** — write 4 rows across 2 years → assert two parquet files exist with the right schema and a `manifest.json` with matching sha256.
 
