@@ -231,6 +231,10 @@ workflows survive transient outages.
 | `divkit` | Library — fetcher, cache, types, yield math |
 | `divkit-cli` | Binary — get, history, backfill, append-today |
 
+## Roadmap
+
+See [`ROADMAP.md`](ROADMAP.md) — what is shipped, what is planned (notably an automated ex/record/pay dividend-dates layer derived from 8-K filings), and what is deliberately out of scope.
+
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE).
