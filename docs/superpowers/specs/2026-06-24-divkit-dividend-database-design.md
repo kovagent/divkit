@@ -49,7 +49,7 @@ Produces `data/dividends-YYYY.parquet` sharded by dividend period-end year.
    for both concepts. Each call returns *every* filer that reported that concept for that period — one request covers ~1,000+ companies. ~40 quarters × 2 concepts ≈ 80 requests for a decade. Entry fields: `accn, cik, entityName, loc, start, end, val`. Accumulate per `(cik, end)`, preferring *Declared* over *CashPaid* on conflict.
 2. **Bulk completeness pass.** Download `https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip` (~1.39 GB, refreshed daily). For each company JSON, extract the two dividend concepts to capture off-calendar fiscal periods and annual-only filers the quarterly frames miss. Union into the frames result, deduped by `(cik, end, concept-priority)`.
 
-Ticker↔CIK from `https://www.sec.gov/files/company_tickers.json`. SEC `User-Agent` must be the bare `divkit <contact-email>` form (parenthetical/URL UAs get 403'd by the SEC WAF). Rate limit ≤ 10 req/s.
+Ticker↔CIK from `https://www.sec.gov/files/company_tickers.json`. SEC `User-Agent` must be the bare `divkit <contact-email>` form (parenthetical/URL UAs get 403'd by the SEC WAF). The contact email comes from env `DIVKIT_CONTACT_EMAIL` (default generic placeholder `divkit-bot@users.noreply.github.com` — SEC accepts generic UAs); CI injects the real address from GitHub secret `CONTACT_EMAIL`. No personal email is committed to the public repo. Rate limit ≤ 10 req/s.
 
 **Nightly delta.** Frames for the current and previous quarter (catches late filings) + companies appearing in the recent submissions feed. Append/update changed rows only; never re-pull the 1.39 GB zip nightly. Idempotent: re-running a day produces no diff.
 
