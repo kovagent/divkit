@@ -150,6 +150,25 @@ pub fn write_dividends(path: &Path, rows: &[DivRow]) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a column by name and downcast it to the expected array type.
+///
+/// Returns `Error::Parquet` (naming the offending column) if the column is
+/// absent or has an unexpected Arrow type, rather than panicking.
+fn column_as<'a, A: Array + 'static>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a A> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| Error::Parquet(format!("missing column: {name}")))?;
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<A>()
+        .ok_or_else(|| Error::Parquet(format!("{name} column type mismatch")))
+}
+
 /// Parse a parquet file (supplied as in-memory bytes) into `DivRow` records.
 pub fn read_dividends(bytes: &[u8]) -> Result<Vec<DivRow>> {
     let owned: bytes::Bytes = bytes::Bytes::copy_from_slice(bytes);
@@ -160,46 +179,16 @@ pub fn read_dividends(bytes: &[u8]) -> Result<Vec<DivRow>> {
     for batch in reader {
         let batch = batch?;
 
-        let cik_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| Error::Parquet("cik column type mismatch".into()))?;
-        let ticker_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Parquet("ticker column type mismatch".into()))?;
-        let period_start_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .ok_or_else(|| Error::Parquet("period_start column type mismatch".into()))?;
-        let period_end_col = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .ok_or_else(|| Error::Parquet("period_end column type mismatch".into()))?;
-        let amount_col = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| Error::Parquet("amount column type mismatch".into()))?;
-        let concept_col = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Parquet("concept column type mismatch".into()))?;
-        let accn_col = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Parquet("accn column type mismatch".into()))?;
-        let form_col = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Error::Parquet("form column type mismatch".into()))?;
+        // Look columns up by name, not by position: the Python builder writes
+        // these files too, and column ordering must not be load-bearing on read.
+        let cik_col = column_as::<UInt32Array>(&batch, "cik")?;
+        let ticker_col = column_as::<StringArray>(&batch, "ticker")?;
+        let period_start_col = column_as::<Date32Array>(&batch, "period_start")?;
+        let period_end_col = column_as::<Date32Array>(&batch, "period_end")?;
+        let amount_col = column_as::<Float64Array>(&batch, "amount")?;
+        let concept_col = column_as::<StringArray>(&batch, "concept")?;
+        let accn_col = column_as::<StringArray>(&batch, "accn")?;
+        let form_col = column_as::<StringArray>(&batch, "form")?;
 
         for i in 0..batch.num_rows() {
             let period_start = from_date32(period_start_col.value(i))
@@ -245,24 +234,48 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dividends-2024.parquet");
         let d = chrono::NaiveDate::parse_from_str("2024-03-15", "%Y-%m-%d").unwrap();
-        let rows = vec![DivRow {
-            cik: 21344,
-            ticker: Some("KO".into()),
-            period_start: d,
-            period_end: d,
-            amount: 0.485,
-            concept: crate::Concept::Declared,
-            accn: "a".into(),
-            form: Some("10-Q".into()),
-        }];
+        let d2 = chrono::NaiveDate::parse_from_str("2023-09-01", "%Y-%m-%d").unwrap();
+        let rows = vec![
+            DivRow {
+                cik: 21344,
+                ticker: Some("KO".into()),
+                period_start: d,
+                period_end: d,
+                amount: 0.485,
+                concept: crate::Concept::Declared,
+                accn: "a".into(),
+                form: Some("10-Q".into()),
+            },
+            // Null ticker + null form + CashPaid concept: exercises the
+            // nullable-string read path and the CashPaid string mapping.
+            DivRow {
+                cik: 320193,
+                ticker: None,
+                period_start: d2,
+                period_end: d2,
+                amount: 0.24,
+                concept: crate::Concept::CashPaid,
+                accn: "b".into(),
+                form: None,
+            },
+        ];
         write_dividends(&path, &rows).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let back = read_dividends(&bytes).unwrap();
-        assert_eq!(back.len(), 1);
+        assert_eq!(back.len(), 2);
+
         assert_eq!(back[0].cik, 21344);
         assert_eq!(back[0].ticker.as_deref(), Some("KO"));
         assert!((back[0].amount - 0.485).abs() < 1e-9);
         assert_eq!(back[0].concept, crate::Concept::Declared);
+        assert_eq!(back[0].form.as_deref(), Some("10-Q"));
+
+        assert_eq!(back[1].cik, 320193);
+        // Nulls must come back as None, never Some("").
+        assert_eq!(back[1].ticker, None);
+        assert_eq!(back[1].form, None);
+        assert!((back[1].amount - 0.24).abs() < 1e-9);
+        assert_eq!(back[1].concept, crate::Concept::CashPaid);
     }
 
     #[test]
