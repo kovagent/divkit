@@ -35,6 +35,7 @@ class Row:
     concept: str   # "Declared" or "CashPaid"
     accn: str
     form: str | None
+    synthesized: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +271,7 @@ def reconcile_periods(rows: list[Row]) -> list[Row]:
             concept=container.concept,
             accn=container.accn,
             form=container.form,
+            synthesized=True,
         )
         synthesized.append(synth)
 
@@ -280,14 +282,35 @@ def reconcile_periods(rows: list[Row]) -> list[Row]:
 # Deduplication — prefer Declared over CashPaid per (cik, period_end)
 # ---------------------------------------------------------------------------
 def _merge_prefer_declared(rows: list[Row]) -> list[Row]:
-    """Deduplicate *rows* by ``(cik, period_end)``, keeping ``Declared`` over ``CashPaid``."""
-    best: dict[tuple[int, str], Row] = {}
+    """Deduplicate *rows* by ``(cik, period_end, synthesized)``, keeping ``Declared`` over
+    ``CashPaid``.
+
+    Synthesized rows are kept separate from non-synthesized rows at the same
+    ``(cik, period_end)`` — they represent a recovered residual that must not be
+    coalesced with a real declared leaf at the same key.
+
+    Within identical ``(cik, period_end)`` and ``synthesized`` status, ``Declared``
+    takes precedence over ``CashPaid``.  When concept and synthesized status both tie,
+    the row with the lexicographically greatest ``accn`` wins (most-recent accession),
+    producing a deterministic result independent of input order.
+    """
+    best: dict[tuple[int, str, bool], Row] = {}
     for row in rows:
-        key = (row.cik, row.period_end)
+        key = (row.cik, row.period_end, row.synthesized)
         existing = best.get(key)
         if existing is None:
             best[key] = row
-        elif existing.concept != "Declared" and row.concept == "Declared":
+            continue
+        # Primary preference: Declared over CashPaid
+        existing_is_declared = existing.concept == "Declared"
+        row_is_declared = row.concept == "Declared"
+        if existing_is_declared and not row_is_declared:
+            continue  # keep existing
+        if row_is_declared and not existing_is_declared:
+            best[key] = row
+            continue
+        # Same concept: keep greatest accn (most-recent accession)
+        if row.accn > existing.accn:
             best[key] = row
     return list(best.values())
 

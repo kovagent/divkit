@@ -73,37 +73,111 @@ impl DividendCache {
 
     /// Load all dividend data from `client` and build the in-memory index.
     ///
-    /// Groups rows by CIK, derives a representative ticker (first non-`None`
-    /// ticker among each CIK's rows, uppercased), constructs a
-    /// [`DividendSnapshot`] per CIK, and indexes entries by both CIK and
-    /// ticker symbol.
+    /// # Index semantics
+    ///
+    /// **`by_ticker[T]`** — built from rows whose ticker equals `T` (uppercased),
+    /// exactly mirroring [`Divkit::dividends`] client semantics. Each ticker maps
+    /// to the snapshot for that specific ticker's rows, so
+    /// `cache.annual_dividend("KO") == client.annual_dividend("KO").await`.
+    ///
+    /// When multiple CIKs share an uppercased ticker symbol, the snapshot whose
+    /// most-recent `period_end` is latest is kept as the authoritative entry
+    /// (the currently-active issuer). Ties are broken by the larger CIK.
+    ///
+    /// A CIK with multiple distinct tickers (ticker change, dual-class shares)
+    /// is indexed under every ticker it has ever used, each with only that
+    /// ticker's own rows.
+    ///
+    /// **`by_cik[cik]`** — all rows for that issuer regardless of ticker,
+    /// which is useful for retrieving the complete history of a renamed issuer.
     pub async fn hydrate_with(client: &Divkit) -> Result<Self> {
         let rows = client.load_all_rows().await?;
 
-        // Group rows by CIK.
+        // ── Build by_ticker ────────────────────────────────────────────────────
+        //
+        // Group by (uppercased ticker, cik) pair so each distinct (ticker, cik)
+        // combination gets its own row list — this handles:
+        //   • Finding 3: a CIK with multiple tickers → one entry per ticker.
+        //   • Finding 4: only ticker-matching rows go into by_ticker[T].
+
+        // (ticker_upper, cik) → Vec<row index>
+        let mut ticker_cik_rows: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            if let Some(t) = row.ticker.as_deref() {
+                ticker_cik_rows
+                    .entry((t.to_uppercase(), row.cik))
+                    .or_default()
+                    .push(i);
+            }
+            // rows with ticker == None are excluded from by_ticker (matching client).
+        }
+
+        // For each distinct uppercased ticker, pick the winning (ticker, cik) pair:
+        // the one whose most-recent period_end is latest, tiebreak by larger cik.
+        // (Finding 2: deterministic collision resolution, never HashMap-order-dependent.)
+        let mut ticker_winner: HashMap<String, (u32, chrono::NaiveDate)> = HashMap::new();
+        for (ticker_upper, cik) in ticker_cik_rows.keys() {
+            // Find the most-recent period_end for this (ticker, cik) pair.
+            let indices = &ticker_cik_rows[&(ticker_upper.clone(), *cik)];
+            let latest = indices
+                .iter()
+                .map(|&i| rows[i].period_end)
+                .max()
+                .unwrap_or(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+
+            ticker_winner
+                .entry(ticker_upper.clone())
+                .and_modify(|(incumbent_cik, incumbent_latest)| {
+                    // Replace if newer, or same date but larger CIK.
+                    if latest > *incumbent_latest
+                        || (latest == *incumbent_latest && cik > incumbent_cik)
+                    {
+                        *incumbent_cik = *cik;
+                        *incumbent_latest = latest;
+                    }
+                })
+                .or_insert((*cik, latest));
+        }
+
+        let mut by_ticker: HashMap<String, DividendSnapshot> = HashMap::new();
+        for (ticker_upper, (winning_cik, _)) in &ticker_winner {
+            let indices = &ticker_cik_rows[&(ticker_upper.clone(), *winning_cik)];
+            let events: Vec<DivEvent> = indices.iter().map(|&i| row_to_event(&rows[i])).collect();
+            let snap = DividendSnapshot::from_events(ticker_upper.clone(), *winning_cik, events);
+            by_ticker.insert(ticker_upper.clone(), snap);
+        }
+
+        // ── Build by_cik ───────────────────────────────────────────────────────
+        //
+        // All rows for a CIK regardless of ticker — gives the complete history
+        // for renamed or dual-class issuers.  The ticker name stored on the
+        // snapshot is the most-recently-used non-None ticker for that CIK,
+        // chosen deterministically (latest period_end among ticker-rows, then
+        // larger CIK as a tiebreak, consistent with by_ticker resolution).
+
         let mut by_cik_rows: HashMap<u32, Vec<usize>> = HashMap::new();
         for (i, row) in rows.iter().enumerate() {
             by_cik_rows.entry(row.cik).or_default().push(i);
         }
 
-        let mut by_ticker: HashMap<String, DividendSnapshot> = HashMap::new();
         let mut by_cik: HashMap<u32, DividendSnapshot> = HashMap::new();
-
-        for (cik, indices) in by_cik_rows {
-            // Pick the first non-None ticker among this CIK's rows.
-            let ticker_opt: Option<String> = indices
+        for (cik, indices) in &by_cik_rows {
+            // Pick the most-recently-used non-None ticker for display.
+            let ticker_str = indices
                 .iter()
-                .find_map(|&i| rows[i].ticker.as_deref().map(|t| t.to_uppercase()));
+                .filter_map(|&i| {
+                    rows[i]
+                        .ticker
+                        .as_deref()
+                        .map(|t| (t.to_uppercase(), rows[i].period_end))
+                })
+                .max_by(|(_, a_end), (_, b_end)| a_end.cmp(b_end))
+                .map(|(t, _)| t)
+                .unwrap_or_default();
 
             let events: Vec<DivEvent> = indices.iter().map(|&i| row_to_event(&rows[i])).collect();
-
-            let ticker_str = ticker_opt.clone().unwrap_or_default();
-            let snap = DividendSnapshot::from_events(ticker_str, cik, events);
-
-            if let Some(t) = ticker_opt {
-                by_ticker.insert(t, snap.clone());
-            }
-            by_cik.insert(cik, snap);
+            let snap = DividendSnapshot::from_events(ticker_str, *cik, events);
+            by_cik.insert(*cik, snap);
         }
 
         Ok(Self {

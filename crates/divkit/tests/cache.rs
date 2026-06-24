@@ -221,3 +221,128 @@ async fn reload_returns_fresh_cache() {
     // We only verify the API surface is callable; the blocking assertion on
     // the reloaded value would hit the real network.
 }
+
+/// Cache and client must agree for a ticker whose CIK also has None-ticker rows.
+///
+/// Builds an in-memory parquet with:
+///   - CIK 21344 / ticker "KO"  (4 rows at 0.485)
+///   - CIK 21344 / ticker None  (1 row at 0.99 — must NOT appear in cache["KO"])
+///
+/// The cache must return the same annual_dividend as the async client for "KO",
+/// proving that None-ticker rows are excluded from the ticker-keyed snapshot
+/// (Finding 4 regression guard).
+#[tokio::test]
+async fn cache_excludes_none_ticker_rows_from_ticker_snapshot() {
+    use divkit::parquet_io::{write_dividends, DivRow};
+    use divkit::Concept;
+    use sha2::{Digest, Sha256};
+
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // Build a synthetic parquet with KO rows + one None-ticker row for same CIK.
+    let ko_dates = [
+        ("2024-01-01", "2024-03-15"),
+        ("2024-04-01", "2024-06-14"),
+        ("2024-07-01", "2024-09-13"),
+        ("2024-10-01", "2024-12-13"),
+    ];
+    let mut rows: Vec<DivRow> = ko_dates
+        .iter()
+        .map(|(start, end)| DivRow {
+            cik: 21344,
+            ticker: Some("KO".into()),
+            period_start: chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").unwrap(),
+            period_end: chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d").unwrap(),
+            amount: 0.485,
+            concept: Concept::Declared,
+            accn: "ko".into(),
+            form: Some("10-Q".into()),
+        })
+        .collect();
+    // Inject a None-ticker row for the same CIK with a much larger amount.
+    // If the cache erroneously includes this row under "KO" the annual_dividend
+    // will differ from the client's value.
+    rows.push(DivRow {
+        cik: 21344,
+        ticker: None,
+        period_start: chrono::NaiveDate::parse_from_str("2024-06-01", "%Y-%m-%d").unwrap(),
+        period_end: chrono::NaiveDate::parse_from_str("2024-06-30", "%Y-%m-%d").unwrap(),
+        amount: 0.99,
+        concept: Concept::Declared,
+        accn: "ko-none".into(),
+        form: None,
+    });
+
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let parquet_path = tmp_dir.path().join("dividends-2024.parquet");
+    write_dividends(&parquet_path, &rows).unwrap();
+    let parquet_bytes = std::fs::read(&parquet_path).unwrap();
+
+    let digest = {
+        let mut h = Sha256::new();
+        h.update(&parquet_bytes);
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let manifest = format!(r#"{{"dividends-2024.parquet": "sha256:{digest}"}}"#);
+
+    // Spin up two identical mock servers (one for client reference, one for cache).
+    let server_a = MockServer::start().await;
+    let server_b = MockServer::start().await;
+    for server in [&server_a, &server_b] {
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(manifest.clone()))
+            .expect(1..)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/dividends-2024.parquet"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(parquet_bytes.clone()))
+            .expect(1..)
+            .mount(server)
+            .await;
+    }
+
+    // Reference value: what the async client returns for "KO".
+    let cache_dir_a = TempDir::new().unwrap();
+    let client_a = Divkit::new()
+        .with_base_url(server_a.uri())
+        .with_cache_dir(cache_dir_a.path().to_path_buf())
+        .with_mirror_url(None);
+    let client_annual = client_a.annual_dividend("KO").await.unwrap();
+
+    // Cache value: must match.
+    let cache_dir_b = TempDir::new().unwrap();
+    let client_b = Divkit::new()
+        .with_base_url(server_b.uri())
+        .with_cache_dir(cache_dir_b.path().to_path_buf())
+        .with_mirror_url(None);
+    let cache = DividendCache::hydrate_with(&client_b).await.unwrap();
+    let cache_annual = cache.annual_dividend("KO");
+
+    assert_eq!(
+        cache_annual, client_annual,
+        "cache.annual_dividend(KO) must equal client.annual_dividend(KO) \
+         even when the CIK has a None-ticker row"
+    );
+    assert_eq!(
+        cache.dividends("KO").len(),
+        4,
+        "KO snapshot must contain exactly 4 events (None-ticker row excluded)"
+    );
+
+    // The None-ticker row must not have inflated KO's snapshot.
+    // The 0.99 row should NOT appear — all 4 KO events are 0.485.
+    for ev in cache.dividends("KO") {
+        assert!(
+            (ev.amount - 0.485).abs() < 1e-9,
+            "KO events must all be 0.485, got {}",
+            ev.amount
+        );
+    }
+
+    let _ = manifest_dir; // suppress unused warning
+}

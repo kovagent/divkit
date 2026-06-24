@@ -77,6 +77,7 @@ use crate::record::{DivEvent, DividendSnapshot};
 ///     .with_base_url("https://my-mirror.example.com/divkit")
 ///     .with_cache_dir(PathBuf::from("/tmp/divkit-test"));
 /// ```
+#[derive(Clone)]
 pub struct Divkit {
     fetcher: CachedFetcher,
 }
@@ -190,21 +191,31 @@ impl Divkit {
 
     /// Blocking variant of [`dividends`][Self::dividends].
     ///
-    /// Works from both sync and async contexts — see [`annual_dividend_blocking`][Self::annual_dividend_blocking].
+    /// Safe to call from synchronous code and from within any tokio runtime
+    /// flavor. See [`annual_dividend_blocking`][Self::annual_dividend_blocking] for details.
     pub fn dividends_blocking(&self, ticker: &str) -> Result<Vec<DivEvent>> {
-        block(self.dividends(ticker))
+        let client = self.clone();
+        let ticker = ticker.to_owned();
+        block(async move { client.dividends(&ticker).await })
     }
 
     /// Blocking variant of [`dividend_snapshot`][Self::dividend_snapshot].
+    ///
+    /// Safe to call from synchronous code and from within any tokio runtime
+    /// flavor. See [`annual_dividend_blocking`][Self::annual_dividend_blocking] for details.
     pub fn dividend_snapshot_blocking(&self, ticker: &str) -> Result<DividendSnapshot> {
-        block(self.dividend_snapshot(ticker))
+        let client = self.clone();
+        let ticker = ticker.to_owned();
+        block(async move { client.dividend_snapshot(&ticker).await })
     }
 
     /// Blocking variant of [`annual_dividend`][Self::annual_dividend].
     ///
-    /// Works from both sync and async contexts:
-    /// - Inside a tokio multi-thread runtime: uses `block_in_place` + `Handle::block_on`.
-    /// - Outside any runtime: spins up a minimal current-thread runtime.
+    /// Safe to call from synchronous code and from within any tokio runtime:
+    /// - Multi-thread runtime: uses `block_in_place` + `Handle::block_on`.
+    /// - Current-thread runtime (e.g. `#[tokio::test]`) or no runtime: the
+    ///   future is driven on a dedicated OS thread with its own runtime, so
+    ///   the caller's runtime is not blocked or re-entered.
     ///
     /// # Example
     ///
@@ -219,7 +230,9 @@ impl Divkit {
     /// # Ok::<(), divkit::Error>(())
     /// ```
     pub fn annual_dividend_blocking(&self, ticker: &str) -> Result<Option<f64>> {
-        block(self.annual_dividend(ticker))
+        let client = self.clone();
+        let ticker = ticker.to_owned();
+        block(async move { client.annual_dividend(&ticker).await })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -382,17 +395,35 @@ pub(crate) fn row_to_event(row: &DivRow) -> DivEvent {
 
 /// Drive a future to completion from any context (sync or async).
 ///
-/// - Inside a tokio multi-thread runtime: `block_in_place` + `Handle::block_on`.
-/// - Outside any runtime: spins up a minimal current-thread runtime.
-pub(crate) fn block<F: std::future::Future<Output = Result<T>>, T>(fut: F) -> Result<T> {
+/// - Inside a tokio **multi-thread** runtime: uses `block_in_place` +
+///   `Handle::block_on`, which is the only safe path for blocking inside an
+///   async context on a multi-thread runtime.
+/// - Inside a tokio **current-thread** runtime (e.g. `#[tokio::test]` or
+///   `#[tokio::main(flavor = "current_thread")]`): `block_in_place` panics on
+///   current-thread runtimes, so the future is handed off to a fresh dedicated
+///   OS thread that builds its own single-threaded runtime and drives the
+///   future there.
+/// - Outside any runtime: behaves identically to the current-thread case above.
+pub(crate) fn block<F, T>(fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        // Current-thread runtime or no runtime: run on a dedicated thread to
+        // avoid calling block_on/block_in_place on the current runtime's
+        // thread (illegal for current-thread runtimes).
+        _ => std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(Error::Io)?;
-            rt.block_on(fut)
-        }
+                .map_err(Error::Io)
+                .and_then(|rt| rt.block_on(fut))
+        })
+        .join()
+        .expect("blocking thread panicked"),
     }
 }

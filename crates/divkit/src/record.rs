@@ -54,6 +54,15 @@ impl DividendSnapshot {
             .collect()
     }
 
+    /// Distinct events with `period_end <= as_of`, ascending.
+    fn distinct_as_of(&self, as_of: NaiveDate) -> Vec<&DivEvent> {
+        let mut seen = std::collections::HashSet::new();
+        self.history
+            .iter()
+            .filter(|e| e.period_end <= as_of && seen.insert(e.period_end))
+            .collect()
+    }
+
     pub fn frequency(&self) -> Frequency {
         let ev = self.distinct();
         if ev.is_empty() {
@@ -68,7 +77,14 @@ impl DividendSnapshot {
             .map(|w| (w[1].period_end - w[0].period_end).num_days())
             .collect();
         gaps.sort_unstable();
-        let med = gaps[gaps.len() / 2];
+        let n = gaps.len();
+        let med = if n % 2 == 1 {
+            gaps[n / 2]
+        } else {
+            let mid = n / 2;
+            // average the two middle elements for even counts
+            (gaps[mid - 1] + gaps[mid] + 1) / 2 // integer average, round up by +1 before /2
+        };
         match med {
             d if d <= 45 => Frequency::Monthly,
             d if d <= 135 => Frequency::Quarterly,
@@ -80,16 +96,27 @@ impl DividendSnapshot {
 
     /// Indicated Annual Dividend (IAD) as of a given date.
     ///
+    /// Restricts the working set to distinct events with `period_end <= as_of`
+    /// before computing frequency and the median, making historical
+    /// back-calculations correct (no future look-ahead).
+    ///
     /// Computes the median of the last `K` regular payments × `K`, where `K`
     /// is the payment frequency (monthly 12 / quarterly 4 / semi-annual 2 /
-    /// annual 1). Using the median rejects special dividends and XBRL
-    /// period-rollup anomalies. Returns `0.0` if the most recent dividend is
-    /// older than ~400 days (stopped payer).
+    /// annual 1). For monthly and quarterly payers (K ≥ 4) the median
+    /// effectively rejects special dividends and XBRL period-rollup anomalies.
+    /// For semi-annual payers (K = 2) the result is the mean of the last two
+    /// payments; for annual payers (K = 1) it is the single most-recent
+    /// payment — raw values in both cases, with no outlier rejection.
+    ///
+    /// Returns `0.0` if the most recent dividend (as of `as_of`) is older than
+    /// ~400 days (stopped payer), or if there are no events up to `as_of`.
     ///
     /// For Irregular/None frequency the estimate falls back to a
     /// trailing-365-day sum anchored to the most recent reported dividend.
+    /// Non-finite amounts are excluded from all calculations.
     pub fn annual_amount_as_of(&self, as_of: NaiveDate) -> f64 {
-        let ev = self.distinct();
+        // Restrict to events up to as_of — no future look-ahead.
+        let ev = self.distinct_as_of(as_of);
         if ev.is_empty() {
             return 0.0;
         }
@@ -101,8 +128,19 @@ impl DividendSnapshot {
             return 0.0;
         }
 
-        // Determine K from payment frequency.
-        let k: usize = match self.frequency() {
+        // Determine K from payment frequency (using only pre-as_of events).
+        // We compute frequency inline over the restricted set to avoid
+        // look-ahead bias; build a temporary snapshot for that call.
+        let freq = {
+            let tmp = DividendSnapshot {
+                ticker: self.ticker.clone(),
+                cik: self.cik,
+                history: ev.iter().map(|e| (*e).clone()).collect(),
+            };
+            tmp.frequency()
+        };
+
+        let k: usize = match freq {
             Frequency::Monthly => 12,
             Frequency::Quarterly => 4,
             Frequency::SemiAnnual => 2,
@@ -111,13 +149,21 @@ impl DividendSnapshot {
         };
 
         if k > 0 {
-            // Take the most-recent min(K, len) distinct events and compute
-            // their median, then scale by K.  The median rejects one-off
-            // special dividends and XBRL rollup outliers that would otherwise
-            // inflate a simple sum.
+            // Take the most-recent min(K, len) distinct events, drop non-finite
+            // amounts, then compute their median and scale by K.
             let take = k.min(ev.len());
-            let mut amounts: Vec<f64> = ev.iter().rev().take(take).map(|e| e.amount).collect();
-            amounts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut amounts: Vec<f64> = ev
+                .iter()
+                .rev()
+                .take(take)
+                .map(|e| e.amount)
+                .filter(|a| a.is_finite())
+                .collect();
+            if amounts.is_empty() {
+                return 0.0;
+            }
+            // NaN-safe sort (NaN filtered above, but use unwrap_or as belt-and-suspenders).
+            amounts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median = if amounts.len() % 2 == 1 {
                 amounts[amounts.len() / 2]
             } else {
@@ -131,7 +177,7 @@ impl DividendSnapshot {
         let cutoff = last - Duration::days(365);
         let trailing: f64 = ev
             .iter()
-            .filter(|e| e.period_end > cutoff && e.period_end <= last)
+            .filter(|e| e.period_end > cutoff && e.period_end <= last && e.amount.is_finite())
             .map(|e| e.amount)
             .sum();
         if trailing > 0.0 {
@@ -139,15 +185,26 @@ impl DividendSnapshot {
         }
 
         // Sparse history but `last` is recent (gate already passed): return
-        // the most-recent payment as-is (do not annualise Irregular/None).
-        ev.last().unwrap().amount
+        // the most-recent finite payment as-is.
+        ev.iter()
+            .rev()
+            .find(|e| e.amount.is_finite())
+            .map(|e| e.amount)
+            .unwrap_or(0.0)
     }
 
     /// Indicated Annual Dividend (IAD): the median of the last K regular
     /// payments times K, where K is the payment frequency (monthly 12 /
-    /// quarterly 4 / semi-annual 2 / annual 1). Using the median rejects
-    /// special dividends and XBRL period-rollup anomalies. Returns 0 if the
-    /// most recent dividend is older than ~400 days (stopped payer).
+    /// quarterly 4 / semi-annual 2 / annual 1).
+    ///
+    /// For monthly and quarterly payers (K ≥ 4) the median effectively rejects
+    /// special dividends and XBRL period-rollup anomalies. For semi-annual
+    /// payers (K = 2) the result is the mean of the last two payments; for
+    /// annual payers (K = 1) it is the single most-recent payment — raw values
+    /// in both cases, with no outlier rejection.
+    ///
+    /// Returns 0 if the most recent dividend is older than ~400 days (stopped
+    /// payer). Non-finite amounts in the source data are excluded.
     ///
     /// Use [`annual_amount_as_of`](Self::annual_amount_as_of) for
     /// deterministic testing or historical back-calculations.
@@ -376,5 +433,88 @@ mod tests {
         // as_of is 2024-01-01 — ~3 years after the last payment
         let as_of = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         assert_eq!(snap.annual_amount_as_of(as_of), 0.0);
+    }
+
+    /// NaN amounts must not panic and must produce a finite result.
+    #[test]
+    fn nan_amount_does_not_panic_and_returns_finite() {
+        let snap = DividendSnapshot::from_events(
+            "NANCO".into(),
+            12345,
+            vec![
+                ev("2024-03-15", f64::NAN),
+                ev("2024-06-14", 0.485),
+                ev("2024-09-13", f64::NAN),
+                ev("2024-12-13", 0.485),
+            ],
+        );
+        let as_of = NaiveDate::from_ymd_opt(2024, 12, 13).unwrap();
+        let result = snap.annual_amount_as_of(as_of);
+        assert!(result.is_finite(), "result must be finite, got {result}");
+        // Two finite values of 0.485 → median 0.485 × 4 = 1.94
+        assert!((result - 1.94).abs() < 1e-9);
+    }
+
+    /// All NaN amounts: must return 0.0, not panic.
+    #[test]
+    fn all_nan_amounts_returns_zero() {
+        let snap = DividendSnapshot::from_events(
+            "ALLNAN".into(),
+            12346,
+            vec![
+                ev("2024-03-15", f64::NAN),
+                ev("2024-06-14", f64::NAN),
+                ev("2024-09-13", f64::NAN),
+                ev("2024-12-13", f64::NAN),
+            ],
+        );
+        let as_of = NaiveDate::from_ymd_opt(2024, 12, 13).unwrap();
+        assert_eq!(snap.annual_amount_as_of(as_of), 0.0);
+    }
+
+    /// Past as_of must exclude future events from the calculation.
+    #[test]
+    fn past_as_of_excludes_future_events() {
+        // History has 4 quarterly payments; first three happened before as_of,
+        // fourth is in the future relative to as_of.
+        let snap = DividendSnapshot::from_events(
+            "FUTURE".into(),
+            77777,
+            vec![
+                ev("2024-03-15", 0.50),
+                ev("2024-06-14", 0.50),
+                ev("2024-09-13", 0.50),
+                ev("2024-12-13", 1.50), // future event — should be excluded
+            ],
+        );
+        // as_of is between the third and fourth event
+        let as_of = NaiveDate::from_ymd_opt(2024, 10, 1).unwrap();
+        let result = snap.annual_amount_as_of(as_of);
+        // Only the first 3 events are visible; 3 events → frequency detection
+        // needs ≥ 2 gaps. Gaps: ~91, ~91 days → Quarterly → K=4; last 3 of 3
+        // taken, all 0.50; median = 0.50 × 4 = 2.00.
+        assert!(result.is_finite(), "result must be finite");
+        // Must NOT include the future 1.50 payment.
+        assert!(
+            (result - 2.00).abs() < 1e-9,
+            "expected 2.00 (future event excluded), got {result}"
+        );
+    }
+
+    /// Even-gap-count frequency: two gaps averaging to a quarterly cadence
+    /// must still resolve to Quarterly, not be skewed by upper-median bias.
+    #[test]
+    fn frequency_even_gap_count_averages_middle_two() {
+        // 3 events → 2 gaps; gaps = [88, 94] days — average = 91 → Quarterly.
+        let snap = DividendSnapshot::from_events(
+            "EVENGAP".into(),
+            88888,
+            vec![
+                ev("2024-01-01", 0.30),
+                ev("2024-03-29", 0.30), // 88 days later
+                ev("2024-07-01", 0.30), // 94 days later
+            ],
+        );
+        assert_eq!(snap.frequency(), Frequency::Quarterly);
     }
 }

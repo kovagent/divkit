@@ -220,6 +220,46 @@ fn annual_dividend_blocking_known_ticker() {
     assert!(annual.is_some());
 }
 
+/// Blocking wrapper from within a `#[tokio::test]` (current-thread) runtime.
+///
+/// `#[tokio::test]` uses a current-thread executor by default. Calling
+/// `block_in_place` on a current-thread runtime panics; the `block()` helper
+/// must detect the current-thread flavor and run the future on a fresh
+/// dedicated OS thread instead.
+#[tokio::test]
+async fn annual_dividend_blocking_from_current_thread_runtime() {
+    let server = MockServer::start().await;
+    let parquet = fixture_bytes();
+
+    Mock::given(method("GET"))
+        .and(path("/manifest.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(manifest_body()))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/dividends-2024.parquet"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(parquet))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let cache_dir = TempDir::new().unwrap();
+    let client = Divkit::new()
+        .with_base_url(server.uri())
+        .with_cache_dir(cache_dir.path().to_path_buf())
+        .with_mirror_url(None);
+
+    // This must NOT panic — a panic here means block() incorrectly called
+    // block_in_place on the current-thread runtime.
+    let annual = client.annual_dividend_blocking("KO").unwrap();
+    assert!(
+        annual.is_some(),
+        "KO must be found even when blocking wrapper is called from current-thread runtime"
+    );
+}
+
 /// Negative test: proves SHA-256 verification is actually active.
 ///
 /// Serves the genuine fixture parquet but advertises a WRONG digest in the

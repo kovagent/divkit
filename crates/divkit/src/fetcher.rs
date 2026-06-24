@@ -70,6 +70,7 @@ type InflightCell = Arc<OnceCell<std::result::Result<Bytes, String>>>;
 
 /// ETag-aware fetcher with retry, single-flight deduplication, CDN mirror
 /// fallback, and SHA-256 manifest verification.
+#[derive(Clone)]
 pub(crate) struct CachedFetcher {
     pub http: reqwest::Client,
     /// Primary origin URL (e.g. `raw.githubusercontent.com/…/data`).
@@ -86,8 +87,14 @@ pub(crate) struct CachedFetcher {
     pub cache_dir: PathBuf,
     /// Per-key in-flight deduplication.
     inflight: Arc<Mutex<HashMap<String, InflightCell>>>,
-    /// SHA-256 manifest loaded once per client session.
-    manifest: Arc<Mutex<Option<HashMap<String, String>>>>,
+    /// SHA-256 manifest memo.
+    ///
+    /// Tri-state:
+    /// - `None`             — not yet attempted; first call will fetch.
+    /// - `Some(None)`       — last attempt was a transient error; next call retries.
+    /// - `Some(Some(map))`  — definitively loaded (empty map = 404 / absent manifest).
+    #[allow(clippy::type_complexity)]
+    manifest: Arc<Mutex<Option<Option<HashMap<String, String>>>>>,
 }
 
 impl CachedFetcher {
@@ -102,7 +109,7 @@ impl CachedFetcher {
             mirror_url,
             cache_dir,
             inflight: Arc::new(Mutex::new(HashMap::new())),
-            manifest: Arc::new(Mutex::new(None)),
+            manifest: Arc::new(Mutex::new(None)), // outer None = not yet attempted
         }
     }
 
@@ -185,11 +192,19 @@ impl CachedFetcher {
                     // Try CDN mirror (single attempt — no retry on mirror).
                     match self.fetch_single(key, &mirror.clone()).await {
                         Ok(bytes) => {
-                            // Write to cache.
+                            // Atomic write: temp → rename so a crash mid-write
+                            // never leaves a truncated file in the cache.
                             if let Err(e) = tokio::fs::create_dir_all(&self.cache_dir).await {
                                 tracing::warn!("could not create cache dir: {e}");
-                            } else if let Err(e) = tokio::fs::write(&cache_path, &bytes).await {
-                                tracing::warn!("could not write mirror response to cache: {e}");
+                            } else {
+                                let tmp_body = cache_path.with_extension("parquet.tmp");
+                                if let Err(e) = tokio::fs::write(&tmp_body, &bytes).await {
+                                    tracing::warn!("could not write mirror response to cache: {e}");
+                                } else if let Err(e) =
+                                    tokio::fs::rename(&tmp_body, &cache_path).await
+                                {
+                                    tracing::warn!("could not rename mirror cache file: {e}");
+                                }
                             }
                             return self
                                 .verify_and_return(key, bytes, &cache_path, &etag_path)
@@ -206,11 +221,13 @@ impl CachedFetcher {
                 } else {
                     tracing::debug!(key, "mirror fallback disabled, returning primary error");
                 }
-                // Stale cache fallback.
+                // Stale cache fallback — verified through SHA-256 manifest check.
                 if cache_path.exists() {
                     tracing::warn!(key, "all transports failed, serving stale cache");
                     let bytes = tokio::fs::read(&cache_path).await?;
-                    return Ok(bytes.into());
+                    return self
+                        .verify_and_return(key, bytes.into(), &cache_path, &etag_path)
+                        .await;
                 }
                 Err(primary_err)
             }
@@ -255,12 +272,17 @@ impl CachedFetcher {
                         .and_then(|v| v.to_str().ok())
                         .map(String::from);
                     let bytes = resp.bytes().await?;
-                    // Write body + ETag atomically.
                     tokio::fs::create_dir_all(cache_path.parent().unwrap_or(Path::new(".")))
                         .await?;
-                    tokio::fs::write(cache_path, &bytes).await?;
+                    // Atomic write: temp → rename so a crash mid-write never
+                    // leaves a truncated file observable as a complete cache entry.
+                    let tmp_body = cache_path.with_extension("parquet.tmp");
+                    tokio::fs::write(&tmp_body, &bytes).await?;
+                    tokio::fs::rename(&tmp_body, cache_path).await?;
                     if let Some(e) = etag {
-                        tokio::fs::write(etag_path, e).await?;
+                        let tmp_etag = etag_path.with_extension("etag.tmp");
+                        tokio::fs::write(&tmp_etag, e).await?;
+                        tokio::fs::rename(&tmp_etag, etag_path).await?;
                     }
                     return Ok(bytes);
                 }
@@ -359,34 +381,61 @@ impl CachedFetcher {
     }
 
     /// Fetch manifest and return the digest for `key`, or `None` if the
-    /// manifest is unavailable or the key is absent.
+    /// manifest is definitively absent or the key is not listed.
+    ///
+    /// Uses a tri-state memo so a transient fetch/parse error does NOT
+    /// permanently disable verification for the session:
+    /// - outer `None`       — not yet attempted; this call will fetch.
+    /// - `Some(None)`       — last attempt was transient; this call retries.
+    /// - `Some(Some(map))`  — definitively loaded (empty map = 404 / absent).
     async fn manifest_digest_for(&self, key: &str) -> Option<String> {
         let mut manifest_guard = self.manifest.lock().await;
-        if manifest_guard.is_none() {
-            // Try to load manifest from primary URL.
+
+        // Fetch when: never attempted (outer None) OR last attempt was transient (Some(None)).
+        let should_fetch = !matches!(&*manifest_guard, Some(Some(_)));
+
+        if should_fetch {
             let manifest_url = format!("{}/manifest.json", self.base_url);
             match self.http.get(&manifest_url).send().await {
+                Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                    // Definitively absent — disable verification; do not retry.
+                    tracing::debug!("manifest.json 404; SHA-256 verification disabled");
+                    *manifest_guard = Some(Some(HashMap::new()));
+                }
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<HashMap<String, String>>().await {
                         Ok(m) => {
-                            *manifest_guard = Some(m);
+                            *manifest_guard = Some(Some(m));
                         }
                         Err(e) => {
-                            tracing::warn!("manifest parse failed: {e}");
-                            *manifest_guard = Some(HashMap::new()); // mark as attempted
+                            // Parse error is transient (e.g. malformed JSON during deploy);
+                            // leave Some(None) so the next call retries.
+                            tracing::warn!("manifest parse failed (will retry): {e}");
+                            *manifest_guard = Some(None);
                         }
                     }
                 }
-                _ => {
-                    // Manifest not present or unreachable; proceed without verification.
-                    *manifest_guard = Some(HashMap::new());
+                Ok(resp) => {
+                    // Non-404 HTTP error (e.g. 503) — transient; retry next call.
+                    tracing::warn!(
+                        "manifest fetch returned HTTP {} (will retry)",
+                        resp.status()
+                    );
+                    *manifest_guard = Some(None);
+                }
+                Err(e) => {
+                    // Network error — transient; retry next call.
+                    tracing::warn!("manifest fetch failed (will retry): {e}");
+                    *manifest_guard = Some(None);
                 }
             }
         }
 
+        // Some(Some(map)) → look up digest; anything else → no digest this call.
         manifest_guard
-            .as_ref()?
-            .get(&format!("{key}.parquet"))
+            .as_ref()
+            .and_then(|inner| inner.as_ref())
+            .and_then(|map| map.get(&format!("{key}.parquet")))
             .and_then(|v| v.strip_prefix("sha256:").map(str::to_string))
     }
 }
@@ -409,12 +458,21 @@ fn is_retriable_error(e: &reqwest::Error) -> bool {
     e.is_connect() || e.is_timeout() || e.is_request()
 }
 
+/// Maximum seconds to honour from a `Retry-After` header.
+///
+/// An unbounded `Retry-After` (e.g. `Retry-After: 2000000000`) would hold the
+/// single-flight cell for decades. Cap at a sane value.
+const RETRY_AFTER_MAX_SECS: u64 = 120;
+
 fn retry_after_delay(resp: &reqwest::Response) -> Option<Duration> {
     let header = resp.headers().get("Retry-After")?;
     let val = header.to_str().ok()?;
     // Try integer seconds first, then give up (RFC 7231 also allows HTTP-date
     // but that's rare for 429; integer seconds is by far the common form).
-    val.trim().parse::<u64>().ok().map(Duration::from_secs)
+    val.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| Duration::from_secs(secs.min(RETRY_AFTER_MAX_SECS)))
 }
 
 fn read_etag(path: &Path) -> Option<String> {
@@ -766,5 +824,133 @@ mod tests {
 
         let result = fetcher.fetch("dividends-2020").await.unwrap();
         assert_eq!(result.as_ref(), stale_body);
+    }
+
+    // ── Finding 1: stale cache + manifest digest → must verify ──────────────
+
+    #[tokio::test]
+    async fn test_stale_corrupt_cache_rejected_when_manifest_present() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let corrupt_body = b"CORRUPT-DATA";
+        let correct_body = b"correct-parquet-bytes";
+        let correct_digest = hex_sha256(correct_body);
+        let manifest_json = format!(r#"{{"dividends-2020.parquet":"sha256:{correct_digest}"}}"#);
+
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(manifest_json),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/dividends-2020.parquet"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache_file = cache_dir.path().join("dividends-2020.parquet");
+        tokio::fs::write(&cache_file, corrupt_body).await.unwrap();
+
+        let mut fetcher = CachedFetcher::new(http, server.uri(), cache_dir.path().to_path_buf());
+        fetcher.set_mirror_url(None);
+
+        let result = fetcher.fetch("dividends-2020").await;
+        assert!(
+            result.is_err(),
+            "corrupt stale cache with manifest digest must return Err"
+        );
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("checksum")
+                || err_str.contains("sha256")
+                || err_str.contains("mismatch"),
+            "expected ChecksumMismatch, got: {err_str}"
+        );
+    }
+
+    // ── Finding 2: transient manifest failure does NOT permanently disable verification ──
+
+    #[tokio::test]
+    async fn test_transient_manifest_503_does_not_disable_verification() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"some-parquet-bytes";
+        let wrong_digest = "0000000000000000000000000000000000000000000000000000000000000000";
+        let manifest_json = format!(r#"{{"dividends-2020.parquet":"sha256:{wrong_digest}"}}"#);
+
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(manifest_json),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/dividends-2020.parquet"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_ref()))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let mut fetcher = CachedFetcher::new(http, server.uri(), cache_dir.path().to_path_buf());
+        fetcher.set_mirror_url(None);
+
+        let first = fetcher.fetch("dividends-2020").await;
+        assert!(
+            first.is_ok(),
+            "first fetch (manifest 503 transient) should succeed: {:?}",
+            first.err()
+        );
+
+        let second = fetcher.fetch("dividends-2020").await;
+        assert!(
+            second.is_err(),
+            "second fetch must detect checksum mismatch after manifest becomes available"
+        );
+        let err_str = second.unwrap_err().to_string();
+        assert!(
+            err_str.contains("checksum")
+                || err_str.contains("sha256")
+                || err_str.contains("mismatch"),
+            "expected ChecksumMismatch, got: {err_str}"
+        );
+    }
+
+    // ── Finding 3: Retry-After cap ────────────────────────────────────────────
+
+    #[test]
+    fn retry_after_clamped_to_max() {
+        assert_eq!(RETRY_AFTER_MAX_SECS, 120);
+        assert_eq!(2_000_000_000u64.min(RETRY_AFTER_MAX_SECS), 120);
+        assert_eq!(60u64.min(RETRY_AFTER_MAX_SECS), 60);
+        assert_eq!(120u64.min(RETRY_AFTER_MAX_SECS), 120);
     }
 }

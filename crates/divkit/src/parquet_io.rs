@@ -172,6 +172,17 @@ fn column_as<'a, A: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Resu
         .ok_or_else(|| Error::Parquet(format!("{name} column type mismatch")))
 }
 
+/// Guard a non-nullable field: return `Err` if the value at row `i` is null
+/// rather than silently coercing to a zero/empty default.
+#[inline]
+fn require_non_null(col: &dyn Array, field: &str, i: usize) -> Result<()> {
+    if col.is_null(i) {
+        Err(Error::Parquet(format!("null {field} at row {i}")))
+    } else {
+        Ok(())
+    }
+}
+
 /// Parse a parquet file (supplied as in-memory bytes) into `DivRow` records.
 pub fn read_dividends(bytes: &[u8]) -> Result<Vec<DivRow>> {
     let owned: bytes::Bytes = bytes::Bytes::copy_from_slice(bytes);
@@ -194,6 +205,14 @@ pub fn read_dividends(bytes: &[u8]) -> Result<Vec<DivRow>> {
         let form_col = column_as::<StringArray>(&batch, "form")?;
 
         for i in 0..batch.num_rows() {
+            // Non-nullable fields: reject silently-coerced nulls.
+            require_non_null(cik_col, "cik", i)?;
+            require_non_null(period_start_col, "period_start", i)?;
+            require_non_null(period_end_col, "period_end", i)?;
+            require_non_null(amount_col, "amount", i)?;
+            require_non_null(accn_col, "accn", i)?;
+            require_non_null(concept_col, "concept", i)?;
+
             let period_start = from_date32(period_start_col.value(i))
                 .ok_or_else(|| Error::Parquet(format!("invalid period_start at row {i}")))?;
             let period_end = from_date32(period_end_col.value(i))
@@ -279,6 +298,126 @@ mod tests {
         assert_eq!(back[1].form, None);
         assert!((back[1].amount - 0.24).abs() < 1e-9);
         assert_eq!(back[1].concept, crate::Concept::CashPaid);
+    }
+
+    /// Build a parquet where `amount` is nullable and contains a NULL at row 0.
+    /// `read_dividends` must return `Err`, not `Ok` with `amount = 0.0`.
+    #[test]
+    fn rejects_null_in_non_nullable_amount() {
+        use arrow::array::{Date32Array, Float64Array, StringArray, UInt32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        // Build a schema where `amount` is marked nullable (mimicking a buggy
+        // Python/pandas writer that defaults all columns to nullable).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cik", DataType::UInt32, false),
+            Field::new("ticker", DataType::Utf8, true),
+            Field::new("period_start", DataType::Date32, false),
+            Field::new("period_end", DataType::Date32, false),
+            Field::new("amount", DataType::Float64, true), // nullable — the bad case
+            Field::new("concept", DataType::Utf8, false),
+            Field::new("accn", DataType::Utf8, false),
+            Field::new("form", DataType::Utf8, true),
+        ]));
+
+        let epoch_days = 19_800i32; // some valid date
+
+        // amount column: one NULL value
+        let amount: Float64Array = vec![None].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![42u32])),
+                Arc::new(StringArray::from(vec![Some("AAPL")])),
+                Arc::new(Date32Array::from(vec![epoch_days])),
+                Arc::new(Date32Array::from(vec![epoch_days])),
+                Arc::new(amount),
+                Arc::new(StringArray::from(vec![Some("Declared")])),
+                Arc::new(StringArray::from(vec![Some("0001234567-24-000001")])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+            ],
+        )
+        .expect("batch construction");
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None).expect("writer creation");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+
+        let result = read_dividends(&buf);
+        assert!(
+            result.is_err(),
+            "expected Err for null amount, got Ok({:?})",
+            result.ok()
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("null amount"),
+            "error message should mention 'null amount', got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_null_in_non_nullable_cik() {
+        use arrow::array::{Date32Array, Float64Array, StringArray, UInt32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cik", DataType::UInt32, true), // nullable — the bad case
+            Field::new("ticker", DataType::Utf8, true),
+            Field::new("period_start", DataType::Date32, false),
+            Field::new("period_end", DataType::Date32, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("concept", DataType::Utf8, false),
+            Field::new("accn", DataType::Utf8, false),
+            Field::new("form", DataType::Utf8, true),
+        ]));
+
+        let epoch_days = 19_800i32;
+        let cik: UInt32Array = vec![None].into_iter().collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(cik),
+                Arc::new(StringArray::from(vec![Some("AAPL")])),
+                Arc::new(Date32Array::from(vec![epoch_days])),
+                Arc::new(Date32Array::from(vec![epoch_days])),
+                Arc::new(Float64Array::from(vec![0.25f64])),
+                Arc::new(StringArray::from(vec![Some("Declared")])),
+                Arc::new(StringArray::from(vec![Some("0001234567-24-000001")])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+            ],
+        )
+        .expect("batch construction");
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None).expect("writer creation");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+
+        let result = read_dividends(&buf);
+        assert!(
+            result.is_err(),
+            "expected Err for null cik, got Ok({:?})",
+            result.ok()
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("null cik"),
+            "error message should mention 'null cik', got: {msg:?}"
+        );
     }
 
     #[test]

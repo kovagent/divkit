@@ -76,7 +76,10 @@ def write_year_shards(
     #    contain.  Containers are dropped; a synthetic leaf is emitted when the leaf
     #    sum falls short of the rollup value (recovering e.g. a missing Q4).  Must run
     #    before (cik, period_end) dedup so the dedup key applies only to discrete rows.
-    filtered = reconcile_periods(all_rows)
+    #    Re-apply sanity filter after reconciliation so synthesized rows are validated
+    #    by the same invariants as real rows (e.g. rejecting implausible date spans that
+    #    can arise when the container itself had a borderline period).
+    filtered = [r for r in reconcile_periods(all_rows) if _is_sane_period(r)]
 
     # 2. Dedup by (cik, period_end) preferring Declared
     deduped = _merge_prefer_declared(filtered)
@@ -155,11 +158,16 @@ def write_year_shards(
 
     # Remove stale shard files for years no longer present (e.g. after a malformed
     # date is filtered out), so they cannot linger in the served data set.
-    written_set = set(written)
-    for existing in glob.glob(os.path.join(out_dir, "dividends-*.parquet")):
-        if existing not in written_set:
-            os.remove(existing)
-            logger.warning("schema: removed stale shard %s", existing)
+    # Skip deletion entirely when nothing was written — a zero-write run means
+    # "no data available this sweep" (e.g. SEC outage, all rows malformed), not
+    # "the dataset is empty".  Deleting existing shards in that case would
+    # silently wipe the entire served dataset.
+    if written:
+        written_set = set(written)
+        for existing in glob.glob(os.path.join(out_dir, "dividends-*.parquet")):
+            if existing not in written_set:
+                os.remove(existing)
+                logger.warning("schema: removed stale shard %s", existing)
 
     return sorted(written)
 
