@@ -66,9 +66,13 @@ def iter_company_dividends(zip_path: str, from_year: int) -> Iterator[Row]:
                         end: str = entry["end"]
                         if int(end[:4]) < from_year:
                             continue
+                        # period_start is optional in XBRL instant facts; fall
+                        # back to period_end so downstream date parsing never
+                        # receives an empty string.
+                        period_start: str = entry.get("start") or end
                         yield Row(
                             cik=cik,
-                            period_start=entry.get("start", ""),
+                            period_start=period_start,
                             period_end=end,
                             amount=float(entry["val"]),
                             concept=concept_label,

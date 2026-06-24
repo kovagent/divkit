@@ -6,6 +6,7 @@ import datetime
 import glob
 import hashlib
 import json
+import logging
 import os
 from collections import defaultdict
 from typing import Iterable
@@ -14,6 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .frames import Row, _merge_prefer_declared
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Arrow schema — exact column order and types per spec
@@ -30,9 +33,12 @@ _SCHEMA = pa.schema([
 ])
 
 
-def _date_from_str(s: str) -> datetime.date:
-    """Parse "YYYY-MM-DD" → datetime.date."""
-    return datetime.date(int(s[:4]), int(s[5:7]), int(s[8:10]))
+def _date_from_str(s: str) -> datetime.date | None:
+    """Parse "YYYY-MM-DD" → datetime.date, or None on any malformed input."""
+    try:
+        return datetime.date(int(s[:4]), int(s[5:7]), int(s[8:10]))
+    except (ValueError, IndexError):
+        return None
 
 
 def write_year_shards(
@@ -62,7 +68,27 @@ def write_year_shards(
     written: list[str] = []
 
     for year in sorted(by_year):
-        year_rows = by_year[year]
+        raw_year_rows = by_year[year]
+
+        # Filter rows whose date strings cannot be parsed; log and skip.
+        year_rows: list[Row] = []
+        for r in raw_year_rows:
+            if _date_from_str(r.period_start) is None:
+                logger.warning(
+                    "schema: skipping row cik=%d period_end=%s — unparseable period_start=%r",
+                    r.cik, r.period_end, r.period_start,
+                )
+                continue
+            if _date_from_str(r.period_end) is None:
+                logger.warning(
+                    "schema: skipping row cik=%d — unparseable period_end=%r",
+                    r.cik, r.period_end,
+                )
+                continue
+            year_rows.append(r)
+
+        if not year_rows:
+            continue
 
         # Build column arrays explicitly — no getattr shortcuts
         cik_arr = pa.array([r.cik for r in year_rows], type=pa.uint32())

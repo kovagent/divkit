@@ -216,6 +216,41 @@ def test_download_skips_when_present(tmp_path, monkeypatch):
     assert dest.read_bytes() == b"already here"
 
 
+def test_iter_company_dividends_missing_start_falls_back_to_end(tmp_path):
+    """An entry with no 'start' key yields a row with period_start == period_end (no crash)."""
+    from divkit_builder import bulk
+
+    facts = {
+        "cik": 55555,
+        "facts": {
+            "us-gaap": {
+                "CommonStockDividendsPerShareDeclared": {
+                    "units": {
+                        "USD/shares": [
+                            # No 'start' key — XBRL instant fact
+                            {
+                                "end": "2024-03-31",
+                                "val": 0.485,
+                                "accn": "a",
+                                "form": "10-Q",
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    zp = tmp_path / "companyfacts.zip"
+    with zipfile.ZipFile(zp, "w") as z:
+        z.writestr("CIK0000055555.json", json.dumps(facts))
+
+    # Must not raise; period_start should fall back to period_end
+    rows = list(bulk.iter_company_dividends(str(zp), from_year=2009))
+    assert len(rows) == 1
+    assert rows[0].period_start == rows[0].period_end == "2024-03-31"
+    assert rows[0].amount == 0.485
+
+
 def test_download_removes_partial_on_failure(tmp_path, monkeypatch):
     """A mid-stream failure removes the .part file and leaves no dest."""
     from divkit_builder import bulk
