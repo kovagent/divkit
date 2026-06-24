@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "divkit-builder"
 version = "0.1.0"
@@ -6,6 +10,9 @@ dependencies = ["edgartools>=2.6", "httpx[http2]>=0.27", "polars>=1.0", "pyarrow
 
 [project.scripts]
 divkit-build = "divkit_builder.build:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["divkit_builder"]
 
 [tool.ruff]
 line-length = 100
