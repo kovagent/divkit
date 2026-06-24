@@ -116,7 +116,8 @@ def write_manifest(out_dir: str) -> None:
     manifest: dict[str, str] = {}
     for path in parquet_files:
         filename = os.path.basename(path)
-        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
         manifest[filename] = f"sha256:{digest}"
 
     manifest_path = os.path.join(out_dir, "manifest.json")
