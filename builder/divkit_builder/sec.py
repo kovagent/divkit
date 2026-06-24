@@ -10,9 +10,7 @@ import httpx
 # ---------------------------------------------------------------------------
 # User-Agent — bare form required by SEC WAF (no parentheses, no URL)
 # ---------------------------------------------------------------------------
-CONTACT_EMAIL: str = os.environ.get(
-    "DIVKIT_CONTACT_EMAIL", "divkit-bot@users.noreply.github.com"
-)
+CONTACT_EMAIL: str = os.environ.get("DIVKIT_CONTACT_EMAIL", "divkit-builder@example.com")
 
 
 def user_agent() -> str:
