@@ -61,7 +61,14 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Publish divkit
+      - name: Publish divkit (skip if version already on crates.io)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p divkit
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='divkit'))")
+          if curl -sf "https://crates.io/api/v1/crates/divkit/${VERSION}" >/dev/null 2>&1; then
+            echo "divkit ${VERSION} already published — skipping."
+          else
+            cargo publish -p divkit
+          fi
