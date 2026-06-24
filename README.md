@@ -89,6 +89,9 @@ async fn bs_dividend_yield(ticker: &str, spot: f64) -> divkit::Result<f64> {
 Pass the result as the annual-dividend (or dividend-yield) argument to your
 option-pricing or Greeks routine.
 
+> [!TIP]
+> `annual_amount()` is anchored to the **most recently reported** dividend (so EDGAR filing lag does not undercount active payers) and decays to `0.0` once the last dividend is older than ~400 days — a company that stopped paying reads as a non-payer, not as stale data.
+
 ## Data source and limitations
 
 Data comes from SEC EDGAR public-domain XBRL filings. The primary concept is
@@ -98,10 +101,14 @@ is used as a fallback when the primary concept is absent.
 The committed database holds **82,919 dividend observations across 2009–2026
 (18 annual shards, ~1.4 MB)**.
 
-**Limitation:** EDGAR reports dividend *amounts* by fiscal period, not
-ex-dividend or pay dates. divkit is the right tool for annual-dividend and
-yield calculations. It is not an ex-date calendar or a forward dividend
-schedule — if you need ex-dates, look to a dedicated market-data provider.
+> [!CAUTION]
+> **divkit gives dividend _amounts_ and the two fiscal-period dates (`period_start`, `period_end`) — NOT ex-dividend dates, record dates, or pay dates.** SEC EDGAR does not publish those in structured form. divkit is the source for annual dividend, payment frequency, and dividend yield. It is **not** an ex-date calendar or a forward dividend schedule. If you need ex-dates, use a dedicated (licensed) corporate-actions feed.
+
+> [!NOTE]
+> Coverage is **US SEC XBRL filers, 2009 onward** — structured XBRL dividend reporting did not exist before ~2009, so there is no earlier history. The most recent one or two quarters may lag until issuers file. This is comprehensive for US dividend-payers in the XBRL era, not a claim of universal history.
+
+> [!IMPORTANT]
+> The data is refreshed automatically by GitHub Actions (`nightly.yml` daily; `backfill.yml` for a full rebuild). The published crate reads pre-built parquet from the repo — it never calls SEC at runtime and needs no API key.
 
 ## API surface
 
