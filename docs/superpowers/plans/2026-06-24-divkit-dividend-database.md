@@ -12,7 +12,7 @@
 
 - Rust edition `2021`; crate license `Apache-2.0`; workspace members `crates/divkit`, `cli`.
 - Mirror curvekit conventions exactly: flat client methods, infallible `Divkit::new()`, blocking wrappers, env overrides `DIVKIT_BASE_URL` / `DIVKIT_CACHE_DIR`, XDG cache dir default `~/.cache/divkit/`.
-- SEC `User-Agent` MUST be the bare form `divkit <contact-email>` — no parenthetical, no URL (SEC WAF returns 403 otherwise). The email is read from env `DIVKIT_CONTACT_EMAIL`, default generic placeholder `divkit-bot@users.noreply.github.com` (SEC accepts generic UAs — returns 200). NEVER hardcode a personal email in source committed to the public repo. CI injects the real address from GitHub secret `CONTACT_EMAIL`. Rate limit ≤ 10 req/s to `data.sec.gov` / `www.sec.gov`.
+- SEC `User-Agent` MUST be the bare form `divkit <contact-email>` — no parenthetical, no URL (SEC WAF returns 403 otherwise). The email is read from env `DIVKIT_CONTACT_EMAIL`, default generic placeholder `divkit-builder@example.com` (SEC accepts generic UAs — returns 200). NEVER hardcode a personal email in source committed to the public repo. CI injects the real address from GitHub secret `CONTACT_EMAIL`. Rate limit ≤ 10 req/s to `data.sec.gov` / `www.sec.gov`.
 - XBRL concepts: `CommonStockDividendsPerShareDeclared` (primary), `CommonStockDividendsPerShareCashPaid` (fallback). Unit `USD-per-shares`. Duration frame keys `CY{YYYY}Q{n}` (NOT the `I` instant suffix).
 - Parquet schema (one row per dividend observation): `cik:u32, ticker:string?, period_start:date32, period_end:date32, amount:f64, concept:string, accn:string, form:string?`. Files named `data/dividends-YYYY.parquet` sharded by `period_end` year. `manifest.json` holds SHA-256 per file.
 - Backfill default depth = earliest available XBRL (~2009) → present; `--from-year` overrides.
@@ -722,7 +722,7 @@ git commit -m "feat: Divkit client, blocking wrappers, free functions"
 
 **Interfaces:**
 - Produces:
-  - `sec.session() -> httpx.Client` with `User-Agent: divkit <email>` where `email = os.environ.get("DIVKIT_CONTACT_EMAIL", "divkit-bot@users.noreply.github.com")`, HTTP/2, and a ≤10 req/s limiter.
+  - `sec.session() -> httpx.Client` with `User-Agent: divkit <email>` where `email = os.environ.get("DIVKIT_CONTACT_EMAIL", "divkit-builder@example.com")`, HTTP/2, and a ≤10 req/s limiter.
   - `sec.user_agent() -> str` — returns the resolved `divkit <email>` UA string (single source of truth, reused by frames/bulk).
   - `sec.ticker_cik_map() -> dict[str, int]` from `https://www.sec.gov/files/company_tickers.json` → `{TICKER: cik_int}` (upper-cased ticker, int CIK).
   - `sec.cik_ticker_map() -> dict[int, str]` inverse (first ticker wins).
@@ -760,7 +760,7 @@ def test_ticker_cik_map_parses_fixture(monkeypatch):
 Run: `cd builder && python -m pytest tests/test_sec.py -q`
 Expected: FAIL — module/functions missing.
 
-- [ ] **Step 4: Implement `sec.py`** — `CONTACT_EMAIL = os.environ.get("DIVKIT_CONTACT_EMAIL", "divkit-bot@users.noreply.github.com")`; `def user_agent() -> str: return f"divkit {CONTACT_EMAIL}"` (bare form, no parens/URL); module-level rate limiter (simple timestamp gate ≥0.1s between calls); `_get_json(url)` via shared client using `user_agent()`; `ticker_cik_map`/`cik_ticker_map` parse the dict-of-dicts JSON. `__init__.py` re-exports `sec`. Add a unit test asserting `user_agent()` is the bare `divkit <email>` form (no `(` or `http`).
+- [ ] **Step 4: Implement `sec.py`** — `CONTACT_EMAIL = os.environ.get("DIVKIT_CONTACT_EMAIL", "divkit-builder@example.com")`; `def user_agent() -> str: return f"divkit {CONTACT_EMAIL}"` (bare form, no parens/URL); module-level rate limiter (simple timestamp gate ≥0.1s between calls); `_get_json(url)` via shared client using `user_agent()`; `ticker_cik_map`/`cik_ticker_map` parse the dict-of-dicts JSON. `__init__.py` re-exports `sec`. Add a unit test asserting `user_agent()` is the bare `divkit <email>` form (no `(` or `http`).
 
 - [ ] **Step 5: Run to verify pass** → `pytest tests/test_sec.py -q` PASS.
 
@@ -789,7 +789,7 @@ git commit -m "feat(builder): SEC session + ticker-CIK map"
 
 Run (proper UA):
 ```bash
-curl -s -H "User-Agent: divkit divkit-bot@users.noreply.github.com" \
+curl -s -H "User-Agent: divkit divkit-builder@example.com" \
   "https://data.sec.gov/api/xbrl/frames/us-gaap/CommonStockDividendsPerShareDeclared/USD-per-shares/CY2022Q1.json" \
   | python -c "import json,sys; d=json.load(sys.stdin); d['data']=d['data'][:5]; print(json.dumps(d))" \
   > builder/tests/fixtures/frames_cy2022q1.json
