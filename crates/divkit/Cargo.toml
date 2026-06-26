@@ -13,7 +13,6 @@ exclude = [
     "/.github",
     "/cli",
     "/builder",
-    "ROADMAP.md",
     "CONTRIBUTING.md",
 ]
 
