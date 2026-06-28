@@ -9,7 +9,7 @@ US equity dividends and dividend yield for Rust, from SEC EDGAR public-domain XB
 divkit = "0.0.3"
 ```
 
-Until it is published to crates.io, depend on the repository directly:
+To track unreleased changes, depend on the repository directly:
 
 ```toml
 divkit = { git = "https://github.com/userFRM/divkit" }

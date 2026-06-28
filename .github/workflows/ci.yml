@@ -2,6 +2,32 @@ name: CI
 on:
   push: { branches: [main] }
   pull_request: { branches: [main] }
+
+permissions:
+  contents: read
+
 jobs:
   ci:
-    uses: userFRM/kit-ci/.github/workflows/ci.yml@main
+    uses: userFRM/kit-ci/.github/workflows/ci.yml@293185873c44fb33090f5e1257ab4e000fe71f92
+
+  # divkit-specific: the Python parquet builder is not covered by the shared
+  # Rust CI, so it keeps its own lint + test + shard-validation job.
+  python:
+    name: ruff + pytest (Python builder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install builder
+        run: pip install -e builder pytest ruff
+      - name: Lint (ruff)
+        run: ruff check builder
+      - name: Tests (pytest)
+        run: pytest builder/tests
+      - name: Validate parquet shards
+        run: python -m divkit_builder.build validate --out data
