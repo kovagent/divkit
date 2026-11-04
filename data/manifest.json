@@ -7,14 +7,14 @@
   "dividends-2014.parquet": "sha256:dde6e8a05f615aaca36bc517d7d321b23ff711aef96dcd5d85f5a2ce63a96155",
   "dividends-2015.parquet": "sha256:9d4de08c1db7e61a20d712ab66cc182f89bd67be8d18ad581a6a700ecc525bc3",
   "dividends-2016.parquet": "sha256:8d0128eb07f14a3c1bdeefc4e83d9d8fe7074cd35eec0c448b41a6ba2cd8754e",
-  "dividends-2017.parquet": "sha256:37fac5a9f597e720fe6252ce6bd195b0a20079ad652dcbfb71190e89be4e9a65",
-  "dividends-2018.parquet": "sha256:99ea0c8b674b6d6ba30331fa1d4922e98f716d1ebb5783dead9d453f815210a5",
-  "dividends-2019.parquet": "sha256:2389339fa42cf54f52787074c3ff190341ffb71af3ffc5a3e7470760fd538942",
-  "dividends-2020.parquet": "sha256:a1ca34d30916ee795d6053cdcbce37600ffaf998ee6430b4a7684bbc0c85b440",
-  "dividends-2021.parquet": "sha256:f8336180442d7aa679af92c2610afb4ac5915691ac7b433a2315fa7b3471700b",
+  "dividends-2017.parquet": "sha256:dc3f5d1fff897f16aa2f1a2a34bfc318a5a0f5d05566f2659c37f299b5f57c53",
+  "dividends-2018.parquet": "sha256:7e574d94f6569a024d4fb298020b2316dfb642104d0e61d1774dd4688d1db290",
+  "dividends-2019.parquet": "sha256:db85529f981a481e0acee7debd7785a10e68b0245dbc545f4df4754e254968af",
+  "dividends-2020.parquet": "sha256:a92703986cbe194f1f915eae3e2d8694eb2b4e7507b139366d933f74a1e5e733",
+  "dividends-2021.parquet": "sha256:1d53b2b476976a60b76f5c939e7c7c25240c9ddb1f290f7b1e743cea33de255a",
   "dividends-2022.parquet": "sha256:92e77a8c51cdffd9cc662edfcaf1e9729c13e2c4c40fa518f3ddf5cc0da10626",
-  "dividends-2023.parquet": "sha256:6c6f9ed7604adc3efc086f41bc90d5b9cc83d1b17875de56f9a623a3adac3e51",
+  "dividends-2023.parquet": "sha256:289b6f939cb39153a01c5eaf6151c835d3aeff21af2192848d25531c0d9bbc67",
   "dividends-2024.parquet": "sha256:8c8ecdb017ab6c716cc6d6b5fde4ba981f4f259386d07d6b565ca56d2e866733",
   "dividends-2025.parquet": "sha256:0706873d1c3dd309e2cb7827b75560a41edb840c43eb44c436621535b0e8cef6",
-  "dividends-2026.parquet": "sha256:59cbfc627ca209cbae0a5a251b8128d717d9c05c48f4ad6a629ad38316710dd4"
+  "dividends-2026.parquet": "sha256:350246d43f424be7d2a43fe231bbd704a4edbf6c44e73824652ab05ac7cf7bc3"
 }
