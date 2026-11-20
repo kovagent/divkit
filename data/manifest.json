@@ -7,14 +7,14 @@
   "dividends-2014.parquet": "sha256:d0875eae3af0a213ef9db4247227beb6c521eb897707ec336bdab65cb3366d38",
   "dividends-2015.parquet": "sha256:0899af422993961269f0b188eb98a6d276b31a44fdf549c9816d7247e1691e02",
   "dividends-2016.parquet": "sha256:eeae805eda49ed2bb724ea0f710dd18a15981c88928ad02ae3cf5d745fdfa398",
-  "dividends-2017.parquet": "sha256:400043b0b6bbafee50c001f70de0d53ba0c689cec966a7a5fd91947001b9b28c",
-  "dividends-2018.parquet": "sha256:5cd42b4dc4296a5ce9abeb81bf43954ca00adf6d54842aa184227fc00b49c7de",
-  "dividends-2019.parquet": "sha256:2322e0be7c5ae4402d92fe72d46e4c15b8090dcd80a9e7aacca38d42f5b51802",
-  "dividends-2020.parquet": "sha256:41a25c4578c9af035887c40cdc671f27d3ec27eb3c8509576243fb4bcd5d4370",
-  "dividends-2021.parquet": "sha256:f60c7dcb3f1424c58fadf5968f96a464b1eea5eff1b6877e6294ae4657a6ab7b",
+  "dividends-2017.parquet": "sha256:60247bda8fa1a0a49a51185418526a40056d06be31f5c574df0fd31cc5cf204f",
+  "dividends-2018.parquet": "sha256:8d4c57f5d682060f3785474b719157fae87761bdc8748a52f02f02c9f6f47dba",
+  "dividends-2019.parquet": "sha256:6ad5e1a86e107f9141c98d3ca5571fc8c28fb7eb9da5eea5bde16c51e91021d9",
+  "dividends-2020.parquet": "sha256:7def264992aec6205de31092143b66f2136e621ccad4a8601583dae406b02eca",
+  "dividends-2021.parquet": "sha256:c7b8fdded04df8c201e0625c20036feef2f17c7f72edc16179f10ce5bd25a557",
   "dividends-2022.parquet": "sha256:7447e9d09a033f94b256b82c030a81db9d33f8a0d213a8c72f612795e5c0b9fa",
   "dividends-2023.parquet": "sha256:17d4c155f90d010f4ee2cadbf7145a8d9985dcead90de68f7e34057181b9c5fc",
   "dividends-2024.parquet": "sha256:60d7ce82e49fa9e0cdb8675cd62b58cf30dba2b7570b046b664b24675a7abc9e",
   "dividends-2025.parquet": "sha256:bb3e7bb0271f821d295f9e626206cb2bf0f6adedd805211a2860cc93dd1ef742",
-  "dividends-2026.parquet": "sha256:58a348d1111bf1132c1f34f2ba9f03c109e3d9a1a2ef540fc9afa99425b381bb"
+  "dividends-2026.parquet": "sha256:4c93b00e066de962de381dc249dde4fc0f9567900789ab45c0ad9a7720131a9c"
 }
